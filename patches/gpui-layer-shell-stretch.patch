@@ -1,0 +1,28 @@
+diff --git a/crates/gpui_linux/src/linux/wayland/window.rs b/crates/gpui_linux/src/linux/wayland/window.rs
+index 2f6190942..cd7565253 100644
+--- a/crates/gpui_linux/src/linux/wayland/window.rs
++++ b/crates/gpui_linux/src/linux/wayland/window.rs
+@@ -162,9 +162,25 @@ impl WaylandSurfaceState {
+             );
+ 
+             let width = f32::from(params.bounds.size.width);
+             let height = f32::from(params.bounds.size.height);
++            let width = if options
++                .anchor
++                .contains(Anchor::LEFT | Anchor::RIGHT)
++            {
++                0.0
++            } else {
++                width
++            };
++            let height = if options
++                .anchor
++                .contains(Anchor::TOP | Anchor::BOTTOM)
++            {
++                0.0
++            } else {
++                height
++            };
+             layer_surface.set_size(width as u32, height as u32);
+ 
+             layer_surface.set_anchor(super::layer_shell::wayland_anchor(options.anchor));
