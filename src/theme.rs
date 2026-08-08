@@ -1,6 +1,17 @@
 use std::{env, time::Duration};
 
-use gpui::{Pixels, Rgba, px, rgba};
+use gpui::{Font, FontFallbacks, Pixels, Rgba, font, px, rgba};
+
+const UI_FONT_FAMILY: &str = "JetBrainsMono Nerd Font Mono";
+const JAPANESE_FONT_FAMILY: &str = "Noto Sans Mono CJK JP";
+
+pub(crate) fn ui_font() -> Font {
+    let mut font = font(UI_FONT_FAMILY);
+    font.fallbacks = Some(FontFallbacks::from_fonts(vec![
+        JAPANESE_FONT_FAMILY.to_string(),
+    ]));
+    font
+}
 
 /// All visual values used by the layer-shell bar.
 ///
@@ -28,14 +39,15 @@ pub struct BarTheme {
     pub active_window_title_max_width: Pixels,
     pub active_workspace_slide_distance: f32,
     pub active_workspace_slide_duration: Duration,
+    pub notification_tray_slide_duration: Duration,
     pub high_contrast: bool,
     pub transparency_disabled: bool,
 }
 
 impl BarTheme {
     pub fn from_environment(bar_height: f32) -> Self {
-        let high_contrast = environment_flag("HYPRBAR_HIGH_CONTRAST");
-        let transparency_disabled = environment_flag("HYPRBAR_DISABLE_TRANSPARENCY");
+        let high_contrast = environment_flag("BAH_HIGH_CONTRAST");
+        let transparency_disabled = environment_flag("BAH_DISABLE_TRANSPARENCY");
 
         Self::new(bar_height, high_contrast, transparency_disabled)
     }
@@ -93,8 +105,9 @@ impl BarTheme {
             clock_font_size: px(13.0),
             active_window_icon_size: px(14.0),
             active_window_title_max_width: px(240.0),
-            active_workspace_slide_distance: 16.0,
-            active_workspace_slide_duration: Duration::from_millis(180),
+            active_workspace_slide_distance: 24.0,
+            active_workspace_slide_duration: Duration::from_millis(240),
+            notification_tray_slide_duration: Duration::from_millis(240),
             high_contrast,
             transparency_disabled,
         }

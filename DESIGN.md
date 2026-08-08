@@ -1,4 +1,4 @@
-# hyprbar デザインメモ
+# bah デザインメモ
 
 ## 目的
 
@@ -7,10 +7,12 @@ macOSのメニューバーに近い軽量な半透明ステータスバーを提
 ## 基本方針
 
 - Window背景は透明にするが、バーのルート要素は完全透明にしない。
+- Bar、Notification Tray、メニューなどのLayer Shell上のパネルは、`BarTheme::background` をそのまま背景に使い、同一の透明度にする。個別のパネルだけ不透明化・透明化しない。
 - 文字色を壁紙の輝度に応じて動的に反転しない。
 - 視認性は暗色半透明背景を第一にし、ぼかしはHyprlandへ委譲する。
 - blurが無効でも、背景と文字だけで読める状態を維持する。
 - 強い影、全面の高彩度色、過剰なアニメーションは使わない。
+- Notification Trayの表示は、右端から220msのイーズアウトでスライドインする。モーション削減設定時は最終位置を直接表示する。
 
 ## 通常モード
 
@@ -33,20 +35,22 @@ macOSのメニューバーに近い軽量な半透明ステータスバーを提
 
 ## アクセシビリティ設定
 
-- `HYPRBAR_HIGH_CONTRAST=1`: 背景を約96%不透明にし、主・副文字と境界線を明るくする。
-- `HYPRBAR_DISABLE_TRANSPARENCY=1`: 背景を完全不透明にする。Hyprlandのblur設定とは独立して動作する。
+- `BAH_HIGH_CONTRAST=1`: 背景を約96%不透明にし、主・副文字と境界線を明るくする。
+- `BAH_DISABLE_TRANSPARENCY=1`: 背景を完全不透明にする。Hyprlandのblur設定とは独立して動作する。
+- `BAH_MEMUSG=1`: Bah自身の常駐メモリ使用量（Linux procfsの`VmRSS`）をINFOログへ1秒ごとに出力する。`1` の場合だけ有効にする。
 - 環境変数は `1`、`true`、`yes` を受け付ける。それ以外の値または未設定は通常モードへフォールバックする。
 
 ## Hyprland連携
 
-- Layer Shell namespaceは `hyprbar` を使用する。
+- Layer Shell namespaceは `bah` を使用する。
 - GPUI側で独自blurや画面解析は行わない。
-- Hyprland 0.55以降ではLuaの `hl.layer_rule` でnamespace `hyprbar` に `blur = true` と `ignore_alpha` を設定する。
+- Hyprland 0.55以降ではLuaの `hl.layer_rule` でnamespace `bah` に `blur = true` と `ignore_alpha` を設定する。
 - ユーザーのHyprland設定は直接変更せず、設定例はREADMEに記載する。
 
 ## 実装上のルール
 
 - 色、余白、角丸、フォントサイズ、バー高は `src/theme.rs` の `BarTheme` に集約する。
+- 新しいLayer Shellパネルの背景色は `BarTheme::background` を使う。`alpha(1.0)` のような個別の不透明度上書きは、明示的なデザイン変更が承認された場合を除き行わない。
 - GPUIの色値は固定revisionの `rgba(0xRRGGBBAA)` 形式を使用する。
 - テキストシャドウは、GPUIが安定した直接APIを提供する場合だけ検討する。二重描画での代用はしない。
 - 壁紙解析、画面キャプチャ、動的な文字色反転、独自GPU blur、外部テーマエンジンは追加しない。

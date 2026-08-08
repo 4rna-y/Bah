@@ -18,7 +18,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Loads `$XDG_CONFIG_HOME/hyprbar/config.toml` when it exists.
+    /// Loads `$XDG_CONFIG_HOME/bah/config.toml` when it exists.
     pub fn load() -> Result<Self> {
         let path = config_path()?;
         if !path.exists() {
@@ -42,5 +42,5 @@ fn config_path() -> Result<PathBuf> {
         None => env::current_dir()
             .context("XDG_CONFIG_HOME is unset and the current directory is unavailable")?,
     };
-    Ok(root.join("hyprbar").join("config.toml"))
+    Ok(root.join("bah").join("config.toml"))
 }

@@ -1,19 +1,22 @@
 use std::path::PathBuf;
 
 use gpui::{
-    Animation, AnimationExt as _, Div, FontWeight, div, ease_out_quint, img, prelude::*, px,
+    Animation, AnimationExt as _, App, Div, FontWeight, MouseButton, MouseDownEvent, Window, div,
+    ease_in_out, img, prelude::*, px,
 };
 
 use crate::{
-    hyprland::{Workspace, WorkspaceSnapshot},
+    hyprland::{Workspace, WorkspaceSnapshot, WorkspaceWindow},
     theme::BarTheme,
 };
 
 /// Renders workspace state received from Hyprland IPC.
 pub struct Workspaces {
     items: Vec<Workspace>,
+    workspace_windows: Vec<WorkspaceWindow>,
     active_window_title: Option<String>,
     active_window_icon: Option<PathBuf>,
+    jump_list_actions: Vec<crate::hyprland::JumpListAction>,
     active_workspace_id: Option<i32>,
     slide_offset: f32,
     transition_id: u32,
@@ -24,16 +27,20 @@ impl Workspaces {
         let active_workspace_id = active_workspace_id(&snapshot.workspaces);
         Self {
             items: snapshot.workspaces,
+            workspace_windows: snapshot.workspace_windows,
             active_window_title: snapshot.active_window_title,
             active_window_icon: snapshot.active_window_icon,
+            jump_list_actions: snapshot.jump_list_actions,
             active_workspace_id,
             slide_offset: 0.0,
             transition_id: 0,
         }
     }
 
-    pub fn replace(&mut self, snapshot: WorkspaceSnapshot, theme: BarTheme) {
+    /// Replaces the IPC state and reports whether the active workspace changed.
+    pub fn replace(&mut self, snapshot: WorkspaceSnapshot, theme: BarTheme) -> bool {
         let next_active_workspace_id = active_workspace_id(&snapshot.workspaces);
+        let active_workspace_changed = self.active_workspace_id != next_active_workspace_id;
         if let (Some(previous), Some(next)) = (self.active_workspace_id, next_active_workspace_id)
             && previous != next
         {
@@ -46,12 +53,33 @@ impl Workspaces {
             self.transition_id = self.transition_id.wrapping_add(1);
         }
         self.items = snapshot.workspaces;
+        self.workspace_windows = snapshot.workspace_windows;
         self.active_window_title = snapshot.active_window_title;
         self.active_window_icon = snapshot.active_window_icon;
+        self.jump_list_actions = snapshot.jump_list_actions;
         self.active_workspace_id = next_active_workspace_id;
+        active_workspace_changed
     }
 
-    pub fn render(&self, theme: BarTheme) -> Div {
+    pub fn jump_list_actions(&self) -> &[crate::hyprland::JumpListAction] {
+        &self.jump_list_actions
+    }
+
+    pub fn windows_for_workspace(&self, workspace_id: i32) -> Vec<WorkspaceWindow> {
+        self.workspace_windows
+            .iter()
+            .filter(|window| window.workspace.id == workspace_id)
+            .cloned()
+            .collect()
+    }
+
+    pub fn render(
+        &self,
+        theme: BarTheme,
+        on_workspace_mouse_down: impl Fn(i32) -> WorkspaceMouseDownHandler,
+        mut on_active_workspace_right_click: Option<WorkspaceMouseDownHandler>,
+        on_inactive_workspace_right_click: impl Fn(i32) -> WorkspaceMouseDownHandler,
+    ) -> Div {
         let mut row = div().flex().items_center().gap(theme.workspace_gap);
         for workspace in &self.items {
             let label = workspace.name.clone();
@@ -70,7 +98,12 @@ impl Workspaces {
                     .font_weight(FontWeight::BOLD)
                     .when(workspace.urgent, |element| {
                         element.bg(theme.urgent_background)
-                    });
+                    })
+                    .on_mouse_down(MouseButton::Left, on_workspace_mouse_down(workspace.id));
+
+                if let Some(handler) = on_active_workspace_right_click.take() {
+                    active_item = active_item.on_mouse_down(MouseButton::Right, handler);
+                }
 
                 if let Some(icon) = &self.active_window_icon {
                     active_item = active_item.child(
@@ -100,7 +133,7 @@ impl Workspaces {
                         active_item.with_animation(
                             ("active-workspace-slide", self.transition_id),
                             Animation::new(theme.active_workspace_slide_duration)
-                                .with_easing(ease_out_quint()),
+                                .with_easing(ease_in_out),
                             move |element, delta| {
                                 element.relative().left(px(offset * (1.0 - delta)))
                             },
@@ -119,6 +152,11 @@ impl Workspaces {
                         .when(workspace.urgent, |element| {
                             element.bg(theme.urgent_background)
                         })
+                        .on_mouse_down(MouseButton::Left, on_workspace_mouse_down(workspace.id))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            on_inactive_workspace_right_click(workspace.id),
+                        )
                         .child(label),
                 );
             }
@@ -126,6 +164,8 @@ impl Workspaces {
         row
     }
 }
+
+pub type WorkspaceMouseDownHandler = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
 
 fn active_workspace_id(workspaces: &[Workspace]) -> Option<i32> {
     workspaces

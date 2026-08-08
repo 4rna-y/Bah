@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use super::jump_list::JumpListAction;
+
 /// Workspace data used by the UI. Individual IDs remain stable for future click dispatchers.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Workspace {
@@ -55,8 +57,38 @@ pub(crate) struct ActiveWindow {
 #[derive(Debug)]
 pub struct WorkspaceSnapshot {
     pub workspaces: Vec<Workspace>,
+    pub workspace_windows: Vec<WorkspaceWindow>,
     pub active_window_title: Option<String>,
     pub active_window_icon: Option<PathBuf>,
+    pub jump_list_actions: Vec<JumpListAction>,
+}
+
+/// A closable window, grouped by the workspace it belongs to.
+#[derive(Clone, Debug, Deserialize)]
+pub struct WorkspaceWindow {
+    pub address: String,
+    #[serde(default, rename = "class")]
+    pub app_id: String,
+    #[serde(default, rename = "initialClass")]
+    pub initial_app_id: String,
+    #[serde(default)]
+    pub title: String,
+    pub workspace: WindowWorkspace,
+    #[serde(skip)]
+    pub display_name: String,
+    #[serde(skip)]
+    pub icon: Option<PathBuf>,
+}
+
+impl WorkspaceWindow {
+    pub fn app_name(&self) -> &str {
+        &self.display_name
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct WindowWorkspace {
+    pub id: i32,
 }
 
 #[cfg(test)]

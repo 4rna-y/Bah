@@ -1,15 +1,29 @@
 mod app;
 mod bar;
 mod config;
+mod config_window;
 mod hyprland;
+mod memory_usage;
 mod modules;
+mod notification_tray;
 mod theme;
 
 use log::{error, info};
 
 fn main() {
     env_logger::init();
-    info!("starting hyprbar");
+    memory_usage::start_if_enabled();
+
+    let mode = match app::RunMode::from_environment() {
+        Ok(mode) => mode,
+        Err(message) => {
+            error!("{message}");
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    info!("starting bah");
     info!(
         "Wayland display: {}",
         std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_string())
@@ -23,5 +37,5 @@ fn main() {
         }
     };
 
-    app::run(config);
+    app::run(mode, config);
 }

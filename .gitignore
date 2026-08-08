@@ -1,2 +1,5 @@
 /target/
 /.cargo/
+/.codex/
+
+DESIGN.md

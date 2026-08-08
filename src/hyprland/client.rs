@@ -11,7 +11,8 @@ use log::debug;
 
 use super::{
     icons::AppIconResolver,
-    types::{ActiveWindow, ActiveWorkspace, Workspace, WorkspaceSnapshot},
+    jump_list::JumpListAction,
+    types::{ActiveWindow, ActiveWorkspace, Workspace, WorkspaceSnapshot, WorkspaceWindow},
 };
 
 /// Paths for Hyprland's command and event Unix sockets.
@@ -24,9 +25,9 @@ pub struct SocketPaths {
 impl SocketPaths {
     pub fn from_environment() -> Result<Self> {
         let runtime = env::var_os("XDG_RUNTIME_DIR")
-            .context("XDG_RUNTIME_DIR is not set; start hyprbar inside Hyprland")?;
+            .context("XDG_RUNTIME_DIR is not set; start bah inside Hyprland")?;
         let signature = env::var("HYPRLAND_INSTANCE_SIGNATURE")
-            .context("HYPRLAND_INSTANCE_SIGNATURE is not set; start hyprbar inside Hyprland")?;
+            .context("HYPRLAND_INSTANCE_SIGNATURE is not set; start bah inside Hyprland")?;
         let base = PathBuf::from(runtime).join("hypr").join(signature);
         let paths = Self {
             command: base.join(".socket.sock"),
@@ -65,6 +66,9 @@ impl HyprlandClient {
     pub fn workspace_snapshot(&mut self) -> Result<WorkspaceSnapshot> {
         let workspaces: Vec<Workspace> = serde_json::from_str(&self.command("j/workspaces")?)
             .context("Hyprland returned invalid workspace JSON")?;
+        let mut workspace_windows: Vec<WorkspaceWindow> =
+            serde_json::from_str(&self.command("j/clients")?)
+                .context("Hyprland returned invalid client JSON")?;
         let active: ActiveWorkspace = serde_json::from_str(&self.command("j/activeworkspace")?)
             .context("Hyprland returned invalid active-workspace JSON")?;
         let active_window: ActiveWindow = serde_json::from_str(&self.command("j/activewindow")?)
@@ -74,6 +78,21 @@ impl HyprlandClient {
         let active_window_icon = self
             .icon_resolver
             .resolve(&active_window.app_id, &active_window.initial_app_id);
+        let jump_list_actions =
+            JumpListAction::resolve(&active_window.app_id, &active_window.initial_app_id);
+        for workspace_window in &mut workspace_windows {
+            workspace_window.display_name = self
+                .icon_resolver
+                .display_name(&workspace_window.app_id, &workspace_window.initial_app_id);
+            workspace_window.icon = self
+                .icon_resolver
+                .resolve(&workspace_window.app_id, &workspace_window.initial_app_id);
+            if workspace_window.display_name == "Unknown application"
+                && !workspace_window.title.trim().is_empty()
+            {
+                workspace_window.display_name = workspace_window.title.clone();
+            }
+        }
         debug!(
             "active window icon: app_id={:?}, resolved={}",
             active_window.app_id,
@@ -84,8 +103,10 @@ impl HyprlandClient {
 
         Ok(WorkspaceSnapshot {
             workspaces: Workspace::display_set(workspaces, active.id),
+            workspace_windows,
             active_window_title,
             active_window_icon,
+            jump_list_actions,
         })
     }
 
@@ -115,5 +136,20 @@ impl HyprlandClient {
             .read_to_string(&mut response)
             .with_context(|| format!("failed to read Hyprland response for {command}"))?;
         Ok(response)
+    }
+
+    /// Sends a Hyprland dispatcher command through the command socket.
+    pub fn dispatch(&self, dispatcher: &str) -> Result<()> {
+        // Hyprland 0.55 evaluates command-socket dispatchers as Lua. The
+        // argument is consequently a dispatcher expression such as
+        // `hl.dsp.focus({ workspace = 3 })`.
+        let response = self.command(&format!("dispatch {dispatcher}"))?;
+        if response.trim() != "ok" {
+            bail!(
+                "Hyprland rejected dispatcher {dispatcher:?}: {}",
+                response.trim()
+            );
+        }
+        Ok(())
     }
 }
