@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use log::debug;
+use serde::Deserialize;
 
 use super::{
     icons::AppIconResolver,
@@ -120,6 +121,18 @@ impl HyprlandClient {
         Ok(BufReader::new(stream))
     }
 
+    /// Returns the address of a mapped Wayland client owned by `pid` and using
+    /// the requested app id. Pairing both values avoids affecting another bah
+    /// window while a device control center is being mapped.
+    pub fn client_address_for(&self, pid: u32, app_id: &str) -> Result<Option<String>> {
+        let clients: Vec<ClientLocator> = serde_json::from_str(&self.command("j/clients")?)
+            .context("Hyprland returned invalid client JSON")?;
+        Ok(clients.into_iter().find_map(|client| {
+            (client.pid == pid && client.mapped && client.app_id == app_id)
+                .then_some(client.address)
+        }))
+    }
+
     fn command(&self, command: &str) -> Result<String> {
         let mut stream = UnixStream::connect(&self.paths.command).with_context(|| {
             format!(
@@ -151,5 +164,34 @@ impl HyprlandClient {
             );
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientLocator {
+    address: String,
+    #[serde(default, rename = "class")]
+    app_id: String,
+    #[serde(default)]
+    mapped: bool,
+    #[serde(default)]
+    pid: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientLocator;
+
+    #[test]
+    fn client_locator_reads_the_hyprland_identity_fields() {
+        let client: ClientLocator = serde_json::from_str(
+            r#"{"address":"0x123","class":"bah-device-control-center","mapped":true,"pid":42}"#,
+        )
+        .unwrap();
+
+        assert_eq!(client.address, "0x123");
+        assert_eq!(client.app_id, "bah-device-control-center");
+        assert!(client.mapped);
+        assert_eq!(client.pid, 42);
     }
 }

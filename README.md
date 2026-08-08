@@ -10,6 +10,7 @@
 - アクティブなWorkspaceを右クリックすると、フォーカス中アプリのDesktop Entryが宣言する`Actions`（LinuxのJump List / Quicklist標準）を表示し、選択したアクションを起動します。`Actions`を宣言していないアプリではメニューを表示しません。
 - 右側の `YYYY-MM-DD HH:MM:SS` 時計。1秒ごとにGPUI Entityを更新します。
 - 時計の右側に通知ボタンを表示し、未処理通知数をバッジで表示します。クリックすると画面右端に固定された、画面幅の35%・画面高の通知トレイを右からスライドインで開きます。
+- 通知トレイ上部にWi-Fi、Bluetooth、既定の音声出力・入力、画面輝度のコントロールを表示します。Wi-FiとBluetoothは左クリックでOn/Off、右クリックでデバイスコントロールセンターを開きます。音量・輝度スライダーはドラッグ中に現在値を表示します。
 - `org.freedesktop.Notifications` のセッションD-Busサービスとして通知を受信し、トレイで個別削除または一括削除できます。既存の通知デーモンが同名サービスを所有している場合は、そのデーモンとの競合を避けて通知受信を無効にします。
 - `.socket.sock` による初期ワークスペース取得と、`.socket2.sock` のworkspace/focused-monitorイベントによる更新
 - IPCが利用不能でも、時計だけを表示して起動継続
@@ -42,7 +43,18 @@ RUST_LOG=info cargo run -- window config
 ```bash
 ./bah
 ./bah window config
+./bah window device-control-center
 ```
+
+`window device-control-center` は現段階では空の通常Windowだけを表示します。通知トレイのWi-Fi／Bluetooth右クリック、または音声入出力のデバイス選択ボタンからも起動できます。Hyprland上では、BahがPIDと`app_id`で自ウィンドウを特定してfloat dispatcherを送るため、個別のWindow Ruleや`Hyprland.lua`設定なしで浮動表示されます。
+
+## デバイスコントロールの動作環境
+
+通知トレイのデバイスコントロールは、NetworkManager、BlueZ、PipeWire/WirePlumber、systemd-logind、およびLinux backlight sysfsを使用します。音声操作にはWirePlumber付属の`wpctl`が実行時に必要です。利用できないサービスやデバイスは個別に「利用不可」と表示され、通知トレイのほかの機能は継続動作します。
+
+- AudioOut: PipeWireの既定Audio Sink
+- AudioIn: PipeWireの既定Audio Source
+- Brightness: `/sys/class/backlight`から優先デバイスを選択し、logind経由で変更
 
 Hyprlandセッションから同じコマンドを実行してください。起動後は次でLayer Surfaceを確認できます。
 
@@ -103,18 +115,26 @@ Bah 自身の常駐メモリ使用量を INFO ログへ1秒ごとに出力する
 
 ```bash
 BAH_MEMUSG=1 RUST_LOG=info cargo run
+./bah --memusg
 ```
 
-この値は `1` の場合だけ有効です。通常は Linux の `/proc/self/smaps_rollup` からRSS、PSS、private、shared、anonymous、swapをKiBとMiBで表示します。`smaps_rollup`を利用できない環境では、`/proc/self/status`の`VmRSS`だけを表示します。共有ページを按分した実質的な負担を見る場合はRSSだけでなくPSSも確認してください。
+環境変数は `1` の場合だけ有効です。CLIの`--memusg`は`BAH_MEMUSG=1`に相当し、`RUST_LOG`未指定時はメモリ測定ログだけをINFOで表示します。通常は Linux の `/proc/self/smaps_rollup` からRSS、PSS、private、shared、anonymous、swapをKiBとMiBで表示します。`smaps_rollup`を利用できない環境では、`/proc/self/status`の`VmRSS`だけを表示します。共有ページを按分した実質的な負担を見る場合はRSSだけでなくPSSも確認してください。
 
 ## GPUバックエンドとメモリ軽量化
 
-BahのGPUI/WGPUはデフォルトでVulkanとOpenGLの両方を初期化します。WGPUバックエンドはプロセス単位の`WGPU_BACKEND`で選択できます。Vulkanだけに限定してメモリ使用量を抑えるには`WGPU_BACKEND=vulkan`を指定します。Vulkanを利用できない環境では`WGPU_BACKEND=gl`でOpenGLだけを使えます。
+BahのGPUI/WGPUはデフォルトでVulkanとOpenGLの両方を初期化します。WGPUバックエンドはプロセス単位の`WGPU_BACKEND`、またはCLIの`--wgpu-backend`で選択できます。Vulkanだけに限定してメモリ使用量を抑えるには`--wgpu-backend vulkan`を指定します。Vulkanを利用できない環境では`--wgpu-backend gl`でOpenGLだけを使えます。CLI指定は既存の`WGPU_BACKEND`環境変数より優先されます。
 
 複数GPUと複数のVulkan ICDがインストールされた環境では、使用しないGPUドライバの列挙だけで常駐メモリが大きく増えることがあります。NixOS x86_64上でIntel GPUだけを使用する場合は、Bahの起動設定に次を追加するとIntel Vulkan ICDだけを読み込みます。この値はマシン固有なので、システム全体ではなくBahのプロセスにだけ指定してください。
 
 ```bash
 VK_DRIVER_FILES=/run/opengl-driver/share/vulkan/icd.d/intel_icd.x86_64.json ./bah
+```
+
+同じ指定はBahのCLIオプションでも行えます。ハイフン区切りを正式形とし、`--vk_driver_files`も互換エイリアスとして受け付けます。CLI指定は既存の`VK_DRIVER_FILES`環境変数より優先されます。
+
+```bash
+./bah --memusg --wgpu-backend vulkan \
+  --vk-driver-files /run/opengl-driver/share/vulkan/icd.d/intel_icd.x86_64.json
 ```
 
 設定後に起動できない場合やGPU構成を変更した場合は、`VK_DRIVER_FILES`を外してドライバの自動探索へ戻します。Vulkan自体を利用できない場合の明示的なフォールバックは次のとおりです。

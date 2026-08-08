@@ -1,13 +1,23 @@
-use std::{sync::MutexGuard, time::Instant};
+use std::{
+    process::Command,
+    sync::MutexGuard,
+    thread,
+    time::{Duration, Instant},
+};
 
-use async_channel::Sender;
+use async_channel::{Receiver, Sender};
 use chrono::{Datelike, Local, NaiveDate};
 use gpui::{
-    Context, FontWeight, Render, Window, WindowHandle, div, ease_in_out, prelude::*, px, relative,
+    Context, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, Window,
+    WindowHandle, div, ease_in_out, prelude::*, px, relative,
 };
+use log::warn;
 
 use crate::{
     modules::notifications::{NotificationEvent, NotificationStore, SharedNotificationStore},
+    modules::system_controls::{
+        AudioEndpoint, ControlAction, ControlSnapshot, LevelStatus, ToggleStatus,
+    },
     theme::{BarTheme, ui_font},
 };
 
@@ -15,7 +25,26 @@ const CALENDAR_HEIGHT_RATIO: f32 = 0.35;
 const CALENDAR_COLUMNS: usize = 7;
 const CALENDAR_ROWS: usize = 6;
 const WEEKDAY_LABELS: [&str; CALENDAR_COLUMNS] = ["日", "月", "火", "水", "木", "金", "土"];
-pub(crate) const TRAY_PANEL_WIDTH_RATIO: f32 = 0.30;
+pub(crate) const TRAY_PANEL_WIDTH_RATIO: f32 = 0.40;
+const CONTROL_PADDING: f32 = 14.0;
+const CONTROL_GAP: f32 = 8.0;
+const CONTROL_ICON_BUTTON_WIDTH: f32 = 32.0;
+const SLIDER_SEND_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SliderKind {
+    AudioOutput,
+    AudioInput,
+    Brightness,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SliderDrag {
+    kind: SliderKind,
+    left: f32,
+    width: f32,
+    last_sent_at: Option<Instant>,
+}
 
 /// A transparent, full-output surface that only receives clicks outside the
 /// tray panel. Keeping this separate lets the animated tray use a narrow GPU
@@ -63,25 +92,31 @@ impl Render for NotificationTrayDismissTarget {
 pub struct NotificationTray {
     notifications: SharedNotificationStore,
     updates: Sender<NotificationEvent>,
+    control_actions: Sender<ControlAction>,
     dismiss_target: WindowHandle<NotificationTrayDismissTarget>,
     theme: BarTheme,
     visible: bool,
     hiding: bool,
     slide_started_at: Option<Instant>,
     start_show_on_first_render: bool,
+    controls: ControlSnapshot,
+    slider_drag: Option<SliderDrag>,
 }
 
 impl NotificationTray {
     pub fn new(
         notifications: SharedNotificationStore,
         updates: Sender<NotificationEvent>,
+        control_updates: Receiver<ControlSnapshot>,
+        control_actions: Sender<ControlAction>,
         dismiss_target: WindowHandle<NotificationTrayDismissTarget>,
         theme: BarTheme,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self {
+        let tray = Self {
             notifications,
             updates,
+            control_actions,
             dismiss_target,
             theme,
             visible: true,
@@ -90,7 +125,34 @@ impl NotificationTray {
             // A layer-shell window can wait for its initial configure longer
             // than the animation duration. Start only once it can render.
             start_show_on_first_render: !cx.reduce_motion(),
-        }
+            controls: ControlSnapshot::default(),
+            slider_drag: None,
+        };
+        Self::start_control_updates(control_updates, cx);
+        tray
+    }
+
+    fn start_control_updates(updates: Receiver<ControlSnapshot>, cx: &mut Context<Self>) {
+        cx.spawn(async move |tray, cx| {
+            while let Ok(snapshot) = updates.recv().await {
+                if tray
+                    .update(cx, |tray, cx| {
+                        let dragging = tray
+                            .slider_drag
+                            .map(|drag| (drag.kind, tray.slider_percent(drag.kind)));
+                        tray.controls = snapshot;
+                        if let Some((kind, percent)) = dragging {
+                            tray.set_slider_percent(kind, percent);
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -133,6 +195,179 @@ impl NotificationTray {
         // Prevent further interaction while the still-visible tray slides out.
         window.set_input_region(Some(&[]));
         cx.notify();
+    }
+
+    fn launch_device_control_center(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hide(window, cx);
+        if let Err(error) = thread::Builder::new()
+            .name("bah-device-control-center-launch".to_string())
+            .spawn(|| {
+                let executable = match std::env::current_exe() {
+                    Ok(executable) => executable,
+                    Err(error) => {
+                        warn!("could not resolve current executable: {error}");
+                        return;
+                    }
+                };
+                if let Err(error) = Command::new(executable)
+                    .args(["window", "device-control-center"])
+                    .spawn()
+                {
+                    warn!("failed to launch device control center: {error}");
+                }
+            })
+        {
+            warn!("failed to start device control center launcher: {error}");
+        }
+    }
+
+    fn launch_config_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hide(window, cx);
+        if let Err(error) = thread::Builder::new()
+            .name("bah-config-window-launch".to_string())
+            .spawn(|| {
+                let executable = match std::env::current_exe() {
+                    Ok(executable) => executable,
+                    Err(error) => {
+                        warn!("could not resolve current executable: {error}");
+                        return;
+                    }
+                };
+                if let Err(error) = Command::new(executable).args(["window", "config"]).spawn() {
+                    warn!("failed to launch config window: {error}");
+                }
+            })
+        {
+            warn!("failed to start config window launcher: {error}");
+        }
+    }
+
+    fn toggle_wifi(&mut self, cx: &mut Context<Self>) {
+        if self.controls.wifi.available {
+            self.controls.wifi.enabled = !self.controls.wifi.enabled;
+            self.controls.wifi.label = if self.controls.wifi.enabled {
+                "未接続".to_string()
+            } else {
+                "Off".to_string()
+            };
+            let _ = self.control_actions.try_send(ControlAction::ToggleWifi);
+            cx.notify();
+        }
+    }
+
+    fn toggle_bluetooth(&mut self, cx: &mut Context<Self>) {
+        if self.controls.bluetooth.available {
+            self.controls.bluetooth.enabled = !self.controls.bluetooth.enabled;
+            self.controls.bluetooth.label = if self.controls.bluetooth.enabled {
+                "未接続".to_string()
+            } else {
+                "Off".to_string()
+            };
+            let _ = self
+                .control_actions
+                .try_send(ControlAction::ToggleBluetooth);
+            cx.notify();
+        }
+    }
+
+    fn toggle_mute(&mut self, endpoint: AudioEndpoint, cx: &mut Context<Self>) {
+        let status = match endpoint {
+            AudioEndpoint::Output => &mut self.controls.audio_output,
+            AudioEndpoint::Input => &mut self.controls.audio_input,
+        };
+        if status.available {
+            status.muted = !status.muted;
+            let _ = self
+                .control_actions
+                .try_send(ControlAction::ToggleMute(endpoint));
+            cx.notify();
+        }
+    }
+
+    fn slider_percent(&self, kind: SliderKind) -> u8 {
+        match kind {
+            SliderKind::AudioOutput => self.controls.audio_output.percent,
+            SliderKind::AudioInput => self.controls.audio_input.percent,
+            SliderKind::Brightness => self.controls.brightness.percent,
+        }
+    }
+
+    fn slider_available(&self, kind: SliderKind) -> bool {
+        match kind {
+            SliderKind::AudioOutput => self.controls.audio_output.available,
+            SliderKind::AudioInput => self.controls.audio_input.available,
+            SliderKind::Brightness => self.controls.brightness.available,
+        }
+    }
+
+    fn set_slider_percent(&mut self, kind: SliderKind, percent: u8) {
+        match kind {
+            SliderKind::AudioOutput => self.controls.audio_output.percent = percent,
+            SliderKind::AudioInput => self.controls.audio_input.percent = percent,
+            SliderKind::Brightness => self.controls.brightness.percent = percent,
+        }
+    }
+
+    fn slider_action(kind: SliderKind, percent: u8) -> ControlAction {
+        match kind {
+            SliderKind::AudioOutput => ControlAction::SetVolume(AudioEndpoint::Output, percent),
+            SliderKind::AudioInput => ControlAction::SetVolume(AudioEndpoint::Input, percent),
+            SliderKind::Brightness => ControlAction::SetBrightness(percent),
+        }
+    }
+
+    fn begin_slider_drag(
+        &mut self,
+        kind: SliderKind,
+        left: f32,
+        width: f32,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.slider_available(kind) {
+            return;
+        }
+        self.slider_drag = Some(SliderDrag {
+            kind,
+            left,
+            width,
+            last_sent_at: None,
+        });
+        self.update_slider(event.position.x.into(), true, cx);
+    }
+
+    fn update_slider(&mut self, pointer_x: f32, force_send: bool, cx: &mut Context<Self>) {
+        let Some(mut drag) = self.slider_drag else {
+            return;
+        };
+        let percent = slider_percent_from_pointer(pointer_x, drag.left, drag.width);
+        self.set_slider_percent(drag.kind, percent);
+        let should_send = force_send
+            || drag
+                .last_sent_at
+                .is_none_or(|last| last.elapsed() >= SLIDER_SEND_INTERVAL);
+        if should_send {
+            let _ = self
+                .control_actions
+                .try_send(Self::slider_action(drag.kind, percent));
+            drag.last_sent_at = Some(Instant::now());
+            self.slider_drag = Some(drag);
+        }
+        cx.notify();
+    }
+
+    fn move_slider(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if event.pressed_button == Some(MouseButton::Left) {
+            self.update_slider(event.position.x.into(), false, cx);
+        }
+    }
+
+    fn end_slider_drag(&mut self, pointer_x: f32, cx: &mut Context<Self>) {
+        if self.slider_drag.is_some() {
+            self.update_slider(pointer_x, true, cx);
+            self.slider_drag = None;
+            cx.notify();
+        }
     }
 
     fn slide_offset(&mut self) -> f32 {
@@ -178,6 +413,182 @@ impl NotificationTray {
         let _ = self.updates.try_send(NotificationEvent::Close(id));
         cx.notify();
     }
+
+    fn render_slider(
+        kind: SliderKind,
+        status: LevelStatus,
+        left: f32,
+        width: f32,
+        theme: BarTheme,
+        dragging: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let percent = status.percent.min(100);
+        let fraction = f32::from(percent) / 100.0;
+        div()
+            .id(match kind {
+                SliderKind::AudioOutput => "audio-output-slider",
+                SliderKind::AudioInput => "audio-input-slider",
+                SliderKind::Brightness => "brightness-slider",
+            })
+            .relative()
+            .h(px(30.0))
+            .flex_1()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .when(!status.available, |slider| slider.opacity(0.4))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event, _, cx| {
+                    this.begin_slider_drag(kind, left, width, event, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(4.0))
+                    .rounded(px(2.0))
+                    .bg(theme.border)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(0.0))
+                            .top(px(0.0))
+                            .h_full()
+                            .w(relative(fraction))
+                            .rounded(px(2.0))
+                            .bg(theme.foreground),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(relative(fraction))
+                            .top(px(-4.0))
+                            .ml(px(-6.0))
+                            .size(px(12.0))
+                            .rounded(px(6.0))
+                            .bg(theme.foreground)
+                            .border_1()
+                            .border_color(theme.background.alpha(1.0))
+                            .when(dragging, |knob| {
+                                knob.child(
+                                    div()
+                                        .absolute()
+                                        .bottom(px(18.0))
+                                        .left(px(-14.0))
+                                        .min_w(px(40.0))
+                                        .px(px(5.0))
+                                        .py(px(3.0))
+                                        .rounded(px(5.0))
+                                        .bg(theme.background.alpha(1.0))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .text_center()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.foreground)
+                                        .child(format!("{percent}%")),
+                                )
+                            }),
+                    ),
+            )
+            .when(!status.available, |slider| {
+                slider.child(
+                    div()
+                        .absolute()
+                        .left(relative(0.5))
+                        .ml(px(-28.0))
+                        .px(px(4.0))
+                        .bg(theme.background.alpha(0.9))
+                        .text_size(px(9.0))
+                        .text_color(theme.muted_foreground)
+                        .child("利用不可"),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_audio_row(
+        endpoint: AudioEndpoint,
+        status: LevelStatus,
+        slider_left: f32,
+        slider_width: f32,
+        theme: BarTheme,
+        dragging: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (row_id, mute_id, device_id, kind, unmuted_icon) = match endpoint {
+            AudioEndpoint::Output => (
+                "audio-output-row",
+                "audio-output-mute",
+                "audio-output-device",
+                SliderKind::AudioOutput,
+                "",
+            ),
+            AudioEndpoint::Input => (
+                "audio-input-row",
+                "audio-input-mute",
+                "audio-input-device",
+                SliderKind::AudioInput,
+                "",
+            ),
+        };
+        let mute_icon = match (endpoint, status.muted) {
+            (AudioEndpoint::Output, true) => "",
+            (AudioEndpoint::Input, true) => "",
+            (_, false) => unmuted_icon,
+        };
+        let slider =
+            Self::render_slider(kind, status, slider_left, slider_width, theme, dragging, cx);
+
+        div()
+            .id(row_id)
+            .h(px(38.0))
+            .flex()
+            .items_center()
+            .gap(px(CONTROL_GAP))
+            .child(
+                div()
+                    .id(mute_id)
+                    .w(px(CONTROL_ICON_BUTTON_WIDTH))
+                    .h(px(30.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .text_size(px(14.0))
+                    .cursor_pointer()
+                    .when(!status.available, |button| button.opacity(0.4))
+                    .hover(|style| style.bg(theme.active_background))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_mute(endpoint, cx);
+                    }))
+                    .child(mute_icon),
+            )
+            .child(slider)
+            .child(
+                div()
+                    .id(device_id)
+                    .w(px(CONTROL_ICON_BUTTON_WIDTH))
+                    .h(px(30.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .text_size(px(14.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.active_background))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.launch_device_control_center(window, cx);
+                    }))
+                    .child(""),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for NotificationTray {
@@ -204,10 +615,121 @@ impl Render for NotificationTray {
         let today = Local::now().date_naive();
         let calendar_days = calendar_days_for_month(today.year(), today.month());
         let slide_distance = f32::from(window.bounds().size.width);
+        let control_width = (slide_distance - CONTROL_PADDING * 2.0).max(1.0);
+        let audio_slider_left = CONTROL_PADDING + CONTROL_ICON_BUTTON_WIDTH + CONTROL_GAP;
+        let audio_slider_width =
+            (control_width - CONTROL_ICON_BUTTON_WIDTH * 2.0 - CONTROL_GAP * 2.0).max(1.0);
+        let wifi = self.controls.wifi.clone();
+        let bluetooth = self.controls.bluetooth.clone();
+        let audio_output = self.controls.audio_output;
+        let audio_input = self.controls.audio_input;
+        let brightness = self.controls.brightness;
+        let output_dragging = self
+            .slider_drag
+            .is_some_and(|drag| drag.kind == SliderKind::AudioOutput);
+        let input_dragging = self
+            .slider_drag
+            .is_some_and(|drag| drag.kind == SliderKind::AudioInput);
+        let brightness_dragging = self
+            .slider_drag
+            .is_some_and(|drag| drag.kind == SliderKind::Brightness);
+
+        let output_row = Self::render_audio_row(
+            AudioEndpoint::Output,
+            audio_output,
+            audio_slider_left,
+            audio_slider_width,
+            theme,
+            output_dragging,
+            cx,
+        );
+        let input_row = Self::render_audio_row(
+            AudioEndpoint::Input,
+            audio_input,
+            audio_slider_left,
+            audio_slider_width,
+            theme,
+            input_dragging,
+            cx,
+        );
+        let brightness_slider = Self::render_slider(
+            SliderKind::Brightness,
+            brightness,
+            CONTROL_PADDING,
+            control_width,
+            theme,
+            brightness_dragging,
+            cx,
+        );
+
+        let wifi_button = control_toggle_button("wifi-control", "", "Wi-Fi", &wifi, theme)
+            .flex_grow(1.0)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.toggle_wifi(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, window, cx| {
+                    this.launch_device_control_center(window, cx);
+                    cx.stop_propagation();
+                }),
+            );
+        let bluetooth_button =
+            control_toggle_button("bluetooth-control", "", "Bluetooth", &bluetooth, theme)
+                .flex_grow(1.0)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_bluetooth(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _, window, cx| {
+                        this.launch_device_control_center(window, cx);
+                        cx.stop_propagation();
+                    }),
+                );
+
+        let controls_panel = div()
+            .id("system-controls")
+            .px(px(CONTROL_PADDING))
+            .py(px(12.0))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .h(px(56.0))
+                    .flex()
+                    .gap(px(CONTROL_GAP))
+                    .child(wifi_button)
+                    .child(bluetooth_button),
+            )
+            .child(output_row)
+            .child(input_row)
+            .child(brightness_slider);
 
         div()
             .size_full()
             .overflow_hidden()
+            .on_mouse_move(cx.listener(|this, event, _, cx| {
+                this.move_slider(event, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    this.end_slider_drag(event.position.x.into(), cx);
+                }),
+            )
             .child(
                 div().size_full().child(
                     div()
@@ -225,15 +747,9 @@ impl Render for NotificationTray {
                                 .px(px(14.0))
                                 .flex()
                                 .items_center()
-                                .justify_between()
                                 .border_b_1()
                                 .border_color(theme.border)
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_size(px(14.0))
-                                        .child(format!("Notifications ({count})")),
-                                )
+                                .child(div().flex_1())
                                 .child(
                                     div()
                                         .flex()
@@ -241,17 +757,18 @@ impl Render for NotificationTray {
                                         .gap(px(6.0))
                                         .child(
                                             div()
-                                                .id("clear-notifications")
-                                                .px(px(7.0))
-                                                .py(px(4.0))
+                                                .id("notification-tray-settings")
+                                                .size(px(22.0))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
                                                 .rounded(px(5.0))
-                                                .text_size(px(11.0))
                                                 .text_color(theme.muted_foreground)
                                                 .hover(|style| style.bg(theme.active_background))
-                                                .on_click(
-                                                    cx.listener(|this, _, _, cx| this.clear(cx)),
-                                                )
-                                                .child("Clear"),
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.launch_config_window(window, cx);
+                                                }))
+                                                .child(""),
                                         )
                                         .child(
                                             div()
@@ -268,6 +785,37 @@ impl Render for NotificationTray {
                                                 }))
                                                 .child("×"),
                                         ),
+                                ),
+                        )
+                        .child(controls_panel)
+                        .child(
+                            div()
+                                .h(theme.bar_height)
+                                .px(px(14.0))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_size(px(14.0))
+                                        .child(format!("Notifications ({count})")),
+                                )
+                                .child(
+                                    div().flex().items_center().gap(px(6.0)).child(
+                                        div()
+                                            .id("clear-notifications")
+                                            .px(px(7.0))
+                                            .py(px(4.0))
+                                            .rounded(px(5.0))
+                                            .text_size(px(11.0))
+                                            .text_color(theme.muted_foreground)
+                                            .hover(|style| style.bg(theme.active_background))
+                                            .on_click(cx.listener(|this, _, _, cx| this.clear(cx)))
+                                            .child("Clear"),
+                                    ),
                                 ),
                         )
                         .child(
@@ -411,6 +959,58 @@ impl Render for NotificationTray {
     }
 }
 
+fn control_toggle_button(
+    id: &'static str,
+    icon: &'static str,
+    title: &'static str,
+    status: &ToggleStatus,
+    theme: BarTheme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .min_w(px(0.0))
+        .h_full()
+        .px(px(12.0))
+        .flex_basis(px(0.0))
+        .flex()
+        .items_center()
+        .gap(px(10.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(theme.border)
+        .cursor_pointer()
+        .when(status.enabled, |button| button.bg(theme.active_background))
+        .when(!status.available, |button| button.opacity(0.4))
+        .hover(|style| style.bg(theme.active_background))
+        .child(div().flex_none().text_size(px(18.0)).child(icon))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .text_size(px(10.0))
+                        .text_color(theme.muted_foreground)
+                        .child(status.label.clone()),
+                ),
+        )
+}
+
+fn slider_percent_from_pointer(pointer_x: f32, left: f32, width: f32) -> u8 {
+    (((pointer_x - left) / width.max(1.0)) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u8
+}
+
 fn calendar_days_for_month(year: i32, month: u32) -> Vec<Option<u32>> {
     let first_day = NaiveDate::from_ymd_opt(year, month, 1).expect("valid calendar month");
     let next_month = if month == 12 {
@@ -434,7 +1034,7 @@ fn calendar_days_for_month(year: i32, month: u32) -> Vec<Option<u32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::calendar_days_for_month;
+    use super::{calendar_days_for_month, slider_percent_from_pointer};
 
     #[test]
     fn calendar_starts_on_the_first_weekday_and_includes_every_day() {
@@ -452,5 +1052,14 @@ mod tests {
 
         assert_eq!(days.iter().flatten().count(), 29);
         assert_eq!(days.iter().flatten().copied().max(), Some(29));
+    }
+
+    #[test]
+    fn slider_percentage_tracks_and_clamps_the_pointer() {
+        assert_eq!(slider_percent_from_pointer(10.0, 10.0, 200.0), 0);
+        assert_eq!(slider_percent_from_pointer(110.0, 10.0, 200.0), 50);
+        assert_eq!(slider_percent_from_pointer(210.0, 10.0, 200.0), 100);
+        assert_eq!(slider_percent_from_pointer(-50.0, 10.0, 200.0), 0);
+        assert_eq!(slider_percent_from_pointer(500.0, 10.0, 200.0), 100);
     }
 }

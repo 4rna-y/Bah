@@ -17,6 +17,7 @@ use crate::{
     modules::{
         clock::Clock,
         notifications::{NotificationEvent, NotificationStore, SharedNotificationStore},
+        system_controls::ControlChannels,
         workspaces::Workspaces,
     },
     notification_tray::{NotificationTray, NotificationTrayDismissTarget, TRAY_PANEL_WIDTH_RATIO},
@@ -35,6 +36,7 @@ pub struct Bar {
     jump_menu_resize_pending: bool,
     notification_tray: Option<WindowHandle<NotificationTray>>,
     notification_tray_dismiss_target: Option<WindowHandle<NotificationTrayDismissTarget>>,
+    controls: ControlChannels,
 }
 
 const JUMP_MENU_ROW_HEIGHT: f32 = 28.0;
@@ -57,6 +59,7 @@ impl Bar {
         notification_updates: Receiver<NotificationEvent>,
         notification_sender: Sender<NotificationEvent>,
         notifications: SharedNotificationStore,
+        controls: ControlChannels,
         theme: BarTheme,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -71,6 +74,7 @@ impl Bar {
             jump_menu_resize_pending: false,
             notification_tray: None,
             notification_tray_dismiss_target: None,
+            controls,
         };
         Self::start_clock(cx);
         Self::start_ipc_updates(ipc_updates, cx);
@@ -188,6 +192,8 @@ impl Bar {
         let notifications = self.notifications.clone();
         let notification_sender = self.notification_sender.clone();
         let theme = self.theme;
+        let control_updates = self.controls.updates.clone();
+        let control_actions = self.controls.actions.clone();
 
         // This surface is static during the animation. It exists only so a
         // click outside the narrow tray surface can dismiss the tray.
@@ -257,6 +263,8 @@ impl Bar {
                     NotificationTray::new(
                         notifications,
                         notification_sender,
+                        control_updates,
+                        control_actions,
                         dismiss_target,
                         theme,
                         cx,

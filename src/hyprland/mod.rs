@@ -4,7 +4,7 @@ mod icons;
 mod jump_list;
 mod types;
 
-use std::{io::BufRead, thread};
+use std::{io::BufRead, thread, time::Duration};
 
 use async_channel::Sender;
 
@@ -43,6 +43,60 @@ pub fn close_window(address: String) {
                 Ok(()) => info!("closed window {address}"),
                 Err(error) => warn!("failed to close window {address}: {error}"),
             }
+        });
+}
+
+/// Floats the newly mapped window belonging to this process without relying on
+/// a Hyprland window rule. The compositor remains authoritative; this only
+/// uses Hyprland's own dispatcher once the uniquely identified client exists.
+pub fn force_float_window_for_process(app_id: &'static str, pid: u32) {
+    let _ = thread::Builder::new()
+        .name("bah-device-control-center-float".to_string())
+        .spawn(move || {
+            let paths = match SocketPaths::from_environment() {
+                Ok(paths) => paths,
+                Err(error) => {
+                    warn!("cannot float {app_id}: {error}");
+                    return;
+                }
+            };
+            let client = HyprlandClient::new(paths);
+            for _ in 0..40 {
+                match client.client_address_for(pid, app_id) {
+                    Ok(Some(address)) => {
+                        let selector = format!("address:{address}");
+                        let dispatcher = format!(
+                            "hl.dsp.window.float({{ action = \"set\", window = {selector:?} }})"
+                        );
+                        match client.dispatch(&dispatcher).and_then(|()| {
+                            let resize = format!(
+                                "hl.dsp.window.resize({{ x = 900, y = 650, window = {selector:?} }})"
+                            );
+                            client.dispatch(&resize)
+                        }).and_then(|()| {
+                            let center =
+                                format!("hl.dsp.window.center({{ window = {selector:?} }})");
+                            client.dispatch(&center)
+                        }) {
+                            Ok(()) => {
+                                info!("floated, resized and centered {app_id} window {address}")
+                            }
+                            Err(error) => {
+                                warn!(
+                                    "failed to float, resize and center {app_id} window {address}: {error}"
+                                )
+                            }
+                        }
+                        return;
+                    }
+                    Ok(None) => thread::sleep(Duration::from_millis(50)),
+                    Err(error) => {
+                        warn!("failed to locate {app_id} window: {error}");
+                        return;
+                    }
+                }
+            }
+            warn!("timed out waiting for {app_id} window for pid {pid}");
         });
 }
 
