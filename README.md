@@ -74,7 +74,22 @@ RUST_LOG=debug cargo run
 
 ```toml
 bar_height = 36.0
+# `bah wallpaper set` により絶対パスが書き込まれます。
+# wallpaper = "/home/user/Pictures/wallpaper.png"
 ```
+
+## 壁紙
+
+壁紙はBarとは別のBottom Layer Surfaceとして描画されるため、通常のアプリとBarの背後に表示され、キーボード・ポインター入力を取得しません。画像は出力全体へアスペクト比を保って`cover`表示します。
+
+```bash
+./bah wallpaper set resrc/wallpaper.png
+./bah wallpaper unset
+```
+
+`set` はパスを正規化して設定ファイルへ保存し、既存のBah壁紙Layerを終了して新しいLayerをバックグラウンドで起動します。`unset` は設定を削除してLayerを終了します。壁紙Layerだけを（設定済みのパスで）起動したいときは `./bah wallpaper` を使えます。
+
+静止画形式（PNG、JPEG、WebPなど）に加え、GIFとアニメーションWebPでは各デコード済みフレームを順に描画します。MP4、WebM、MKV、AVI、MOV、M4VはFFmpegでデコードし、30fpsでLayerへ渡します。動画は音声なしで繰り返し再生されます。Nix開発環境にはFFmpegを含めています。Nix環境外で実行する場合は、`ffmpeg`と`ffprobe`を`PATH`から実行可能にしてください。
 
 ## 視認性と外観
 

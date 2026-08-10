@@ -4,9 +4,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     os::fd::AsRawFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
+    thread,
+    time::Duration,
 };
 
+use anyhow::{Context as _, Result, bail};
 use gpui::{
     App, AppContext, Bounds, Size, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
     WindowKind, WindowOptions, layer_shell::*, point, px,
@@ -25,12 +29,15 @@ use crate::{
         system_controls,
     },
     theme::BarTheme,
+    wallpaper::Wallpaper,
 };
 
 const CONFIG_WINDOW_LOCK_FILE: &str = "bah/config-window.lock";
 const DEVICE_CONTROL_CENTER_LOCK_FILE: &str = "bah/device-control-center.lock";
+const WALLPAPER_LOCK_FILE: &str = "bah/wallpaper.lock";
+const WALLPAPER_PID_FILE: &str = "bah/wallpaper.pid";
 const USAGE: &str = "usage: bah [--memusg] [--wgpu-backend BACKENDS] [--vk-driver-files PATH] \
-     [window config|window device-control-center]";
+     [window config|window device-control-center|wallpaper [set PATH|unset]]";
 
 /// Options that must be applied before GPUI initializes its graphics backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,11 +143,14 @@ fn validate_wgpu_backend(value: &OsStr) -> Result<(), String> {
 }
 
 /// Selects which surface this invocation creates.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunMode {
     Bar,
     ConfigWindow,
     DeviceControlCenter,
+    Wallpaper,
+    WallpaperSet(PathBuf),
+    WallpaperUnset,
 }
 
 impl RunMode {
@@ -161,6 +171,13 @@ impl RunMode {
             {
                 Ok(Self::DeviceControlCenter)
             }
+            [wallpaper] if wallpaper == "wallpaper" => Ok(Self::Wallpaper),
+            [wallpaper, set, path] if wallpaper == "wallpaper" && set == "set" => {
+                Ok(Self::WallpaperSet(PathBuf::from(path)))
+            }
+            [wallpaper, unset] if wallpaper == "wallpaper" && unset == "unset" => {
+                Ok(Self::WallpaperUnset)
+            }
             _ => Err(USAGE.to_string()),
         }
     }
@@ -172,6 +189,166 @@ pub fn run(mode: RunMode, config: Config) {
         RunMode::Bar => run_bar(config),
         RunMode::ConfigWindow => run_config_window(config),
         RunMode::DeviceControlCenter => run_device_control_center(),
+        RunMode::Wallpaper => run_wallpaper(config),
+        RunMode::WallpaperSet(_) | RunMode::WallpaperUnset => {
+            unreachable!("commands exit before run")
+        }
+    }
+}
+
+/// Applies `wallpaper set` / `unset`. `true` means that no UI should be run.
+pub fn handle_wallpaper_command(mode: &RunMode, mut config: Config) -> Result<bool> {
+    match mode {
+        RunMode::WallpaperSet(path) => {
+            let path = canonical_wallpaper_path(path)?;
+            config.wallpaper = Some(path);
+            config.save()?;
+            replace_wallpaper_process()?;
+            Ok(true)
+        }
+        RunMode::WallpaperUnset => {
+            config.wallpaper = None;
+            config.save()?;
+            stop_wallpaper_process()?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn canonical_wallpaper_path(path: &Path) -> Result<PathBuf> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("wallpaper file does not exist: {}", path.display()))?;
+    if !path.is_file() {
+        bail!("wallpaper path is not a file: {}", path.display());
+    }
+    Ok(path)
+}
+
+fn replace_wallpaper_process() -> Result<()> {
+    stop_wallpaper_process()?;
+    let executable = env::current_exe().context("failed to resolve bah executable")?;
+    Command::new(executable)
+        .arg("wallpaper")
+        .spawn()
+        .context("failed to start wallpaper layer")?;
+    Ok(())
+}
+
+fn stop_wallpaper_process() -> Result<()> {
+    let path = runtime_wallpaper_pid_path()?;
+    let Ok(pid) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(pid) = pid.trim().parse::<i32>() else {
+        let _ = fs::remove_file(path);
+        return Ok(());
+    };
+    if !is_wallpaper_process(pid) {
+        // Never signal a PID which may have been reused after a crash.
+        let _ = fs::remove_file(path);
+        return Ok(());
+    }
+    // The PID is written only by a Bah wallpaper layer. SIGTERM permits the
+    // layer-shell client to tear down its surface cleanly.
+    let result = unsafe { kill(pid, SIGTERM) };
+    if result != 0 && io::Error::last_os_error().raw_os_error() != Some(3) {
+        return Err(io::Error::last_os_error().into());
+    }
+    for _ in 0..20 {
+        if unsafe { kill(pid, 0) } != 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = fs::remove_file(path);
+    Ok(())
+}
+
+fn is_wallpaper_process(pid: i32) -> bool {
+    let Ok(executable) = env::current_exe().and_then(fs::canonicalize) else {
+        return false;
+    };
+    let Ok(process_executable) = fs::canonicalize(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    if process_executable != executable {
+        return false;
+    }
+    let Ok(command_line) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    command_line
+        .split(|byte| *byte == 0)
+        .any(|argument| argument == b"wallpaper")
+}
+
+fn runtime_wallpaper_pid_path() -> io::Result<PathBuf> {
+    runtime_lock_path(WALLPAPER_PID_FILE)
+}
+
+fn run_wallpaper(config: Config) {
+    let Some(source) = config.wallpaper else {
+        info!("no wallpaper configured; wallpaper layer will not be created");
+        return;
+    };
+    if !source.is_file() {
+        error!(
+            "configured wallpaper no longer exists: {}",
+            source.display()
+        );
+        return;
+    }
+    let lock = match WallpaperLock::acquire() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            info!("a wallpaper layer is already running; ignoring this invocation");
+            return;
+        }
+        Err(error) => {
+            error!("could not lock wallpaper layer: {error}");
+            return;
+        }
+    };
+    match runtime_wallpaper_pid_path().and_then(|path| {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, std::process::id().to_string())
+    }) {
+        Ok(()) => {}
+        Err(error) => error!("could not record wallpaper process: {error}"),
+    }
+    application().run(move |cx: &mut App| {
+        let result = cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                focus: false,
+                app_id: Some("bah-wallpaper".to_string()),
+                window_background: WindowBackgroundAppearance::Opaque,
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: Size::new(px(1.0), px(1.0)),
+                })),
+                kind: WindowKind::LayerShell(LayerShellOptions {
+                    namespace: "bah-wallpaper".to_string(),
+                    layer: Layer::Bottom,
+                    anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                    keyboard_interactivity: KeyboardInteractivity::None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|cx| Wallpaper::new(source.clone(), lock.into_file(), cx)),
+        );
+        match result {
+            Ok(_) => info!("wallpaper Layer Shell window created"),
+            Err(error) => error!("failed to create wallpaper Layer Shell window: {error}"),
+        }
+    });
+    if let Ok(path) = runtime_wallpaper_pid_path() {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -344,6 +521,38 @@ pub struct ConfigWindowLock {
     _file: File,
 }
 
+/// Advisory lock that makes a wallpaper layer a singleton per user.
+struct WallpaperLock {
+    file: File,
+}
+
+impl WallpaperLock {
+    fn acquire() -> io::Result<Option<Self>> {
+        let path = runtime_lock_path(WALLPAPER_LOCK_FILE)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+        if result == 0 {
+            Ok(Some(Self { file }))
+        } else if io::Error::last_os_error().raw_os_error() == Some(11) {
+            Ok(None)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn into_file(self) -> File {
+        self.file
+    }
+}
+
 impl ConfigWindowLock {
     fn acquire() -> io::Result<Option<Self>> {
         let path = config_window_lock_path()?;
@@ -424,7 +633,10 @@ const LOCK_NB: i32 = 4;
 
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
+    fn kill(pid: i32, signal: i32) -> i32;
 }
+
+const SIGTERM: i32 = 15;
 
 #[cfg(test)]
 mod tests {
@@ -440,6 +652,15 @@ mod tests {
         assert_eq!(
             RunMode::from_args(["window", "device-control-center"]),
             Ok(RunMode::DeviceControlCenter)
+        );
+        assert_eq!(RunMode::from_args(["wallpaper"]), Ok(RunMode::Wallpaper));
+        assert_eq!(
+            RunMode::from_args(["wallpaper", "set", "resrc/wallpaper.png"]),
+            Ok(RunMode::WallpaperSet("resrc/wallpaper.png".into()))
+        );
+        assert_eq!(
+            RunMode::from_args(["wallpaper", "unset"]),
+            Ok(RunMode::WallpaperUnset)
         );
         assert!(RunMode::from_args(["window"]).is_err());
         assert!(RunMode::from_args(["window", "other"]).is_err());

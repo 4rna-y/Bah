@@ -8,6 +8,7 @@ mod memory_usage;
 mod modules;
 mod notification_tray;
 mod theme;
+mod wallpaper;
 
 use log::{error, info};
 
@@ -54,6 +55,16 @@ fn main() {
             config::Config::default()
         }
     };
+
+    match app::handle_wallpaper_command(&options.mode, config.clone()) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            error!("wallpaper command failed: {error:#}");
+            eprintln!("bah: {error:#}");
+            std::process::exit(1);
+        }
+    }
 
     app::run(options.mode, config);
 }

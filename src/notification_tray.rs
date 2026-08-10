@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
 use chrono::{Datelike, Local, NaiveDate};
 use gpui::{
     Context, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, Window,
@@ -101,18 +101,20 @@ pub struct NotificationTray {
     start_show_on_first_render: bool,
     controls: ControlSnapshot,
     slider_drag: Option<SliderDrag>,
+    calendar_month: NaiveDate,
 }
 
 impl NotificationTray {
     pub fn new(
         notifications: SharedNotificationStore,
         updates: Sender<NotificationEvent>,
-        control_updates: Receiver<ControlSnapshot>,
+        controls: ControlSnapshot,
         control_actions: Sender<ControlAction>,
         dismiss_target: WindowHandle<NotificationTrayDismissTarget>,
         theme: BarTheme,
         cx: &mut Context<Self>,
     ) -> Self {
+        let today = Local::now().date_naive();
         let tray = Self {
             notifications,
             updates,
@@ -125,34 +127,23 @@ impl NotificationTray {
             // A layer-shell window can wait for its initial configure longer
             // than the animation duration. Start only once it can render.
             start_show_on_first_render: !cx.reduce_motion(),
-            controls: ControlSnapshot::default(),
+            controls,
             slider_drag: None,
+            calendar_month: NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
+                .expect("current date has a valid month"),
         };
-        Self::start_control_updates(control_updates, cx);
         tray
     }
 
-    fn start_control_updates(updates: Receiver<ControlSnapshot>, cx: &mut Context<Self>) {
-        cx.spawn(async move |tray, cx| {
-            while let Ok(snapshot) = updates.recv().await {
-                if tray
-                    .update(cx, |tray, cx| {
-                        let dragging = tray
-                            .slider_drag
-                            .map(|drag| (drag.kind, tray.slider_percent(drag.kind)));
-                        tray.controls = snapshot;
-                        if let Some((kind, percent)) = dragging {
-                            tray.set_slider_percent(kind, percent);
-                        }
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        })
-        .detach();
+    pub(crate) fn set_controls(&mut self, controls: ControlSnapshot, cx: &mut Context<Self>) {
+        let dragging = self
+            .slider_drag
+            .map(|drag| (drag.kind, self.slider_percent(drag.kind)));
+        self.controls = controls;
+        if let Some((kind, percent)) = dragging {
+            self.set_slider_percent(kind, percent);
+        }
+        cx.notify();
     }
 
     pub(crate) fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -414,6 +405,16 @@ impl NotificationTray {
         cx.notify();
     }
 
+    fn show_previous_calendar_month(&mut self, cx: &mut Context<Self>) {
+        self.calendar_month = adjacent_calendar_month(self.calendar_month, -1);
+        cx.notify();
+    }
+
+    fn show_next_calendar_month(&mut self, cx: &mut Context<Self>) {
+        self.calendar_month = adjacent_calendar_month(self.calendar_month, 1);
+        cx.notify();
+    }
+
     fn render_slider(
         kind: SliderKind,
         status: LevelStatus,
@@ -613,7 +614,8 @@ impl Render for NotificationTray {
         let notifications = self.store().snapshot();
         let count = notifications.len();
         let today = Local::now().date_naive();
-        let calendar_days = calendar_days_for_month(today.year(), today.month());
+        let calendar_month = self.calendar_month;
+        let calendar_days = calendar_days_for_month(calendar_month.year(), calendar_month.month());
         let slide_distance = f32::from(window.bounds().size.width);
         let control_width = (slide_distance - CONTROL_PADDING * 2.0).max(1.0);
         let audio_slider_left = CONTROL_PADDING + CONTROL_ICON_BUTTON_WIDTH + CONTROL_GAP;
@@ -655,29 +657,60 @@ impl Render for NotificationTray {
         let brightness_slider = Self::render_slider(
             SliderKind::Brightness,
             brightness,
-            CONTROL_PADDING,
-            control_width,
+            audio_slider_left,
+            audio_slider_width,
             theme,
             brightness_dragging,
             cx,
         );
-
-        let wifi_button = control_toggle_button("wifi-control", "", "Wi-Fi", &wifi, theme)
-            .flex_grow(1.0)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.toggle_wifi(cx);
-                    cx.stop_propagation();
-                }),
+        let brightness_row = div()
+            .id("brightness-row")
+            .h(px(38.0))
+            .flex()
+            .items_center()
+            .gap(px(CONTROL_GAP))
+            .child(
+                div()
+                    .id("brightness-icon")
+                    .w(px(CONTROL_ICON_BUTTON_WIDTH))
+                    .h(px(30.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(18.0))
+                    .child("\u{f0599}"),
             )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, window, cx| {
-                    this.launch_device_control_center(window, cx);
-                    cx.stop_propagation();
-                }),
+            .child(brightness_slider)
+            .child(
+                div()
+                    .w(px(CONTROL_ICON_BUTTON_WIDTH))
+                    .h(px(30.0))
+                    .flex_none(),
             );
+
+        let (network_icon, network_title) = if wifi.wired {
+            ("󰈀", "有線接続")
+        } else {
+            ("", "Wi-Fi")
+        };
+        let wifi_button =
+            control_toggle_button("wifi-control", network_icon, network_title, &wifi, theme)
+                .flex_grow(1.0)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.toggle_wifi(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _, window, cx| {
+                        this.launch_device_control_center(window, cx);
+                        cx.stop_propagation();
+                    }),
+                );
         let bluetooth_button =
             control_toggle_button("bluetooth-control", "", "Bluetooth", &bluetooth, theme)
                 .flex_grow(1.0)
@@ -716,7 +749,7 @@ impl Render for NotificationTray {
             )
             .child(output_row)
             .child(input_row)
-            .child(brightness_slider);
+            .child(brightness_row);
 
         div()
             .size_full()
@@ -903,7 +936,58 @@ impl Render for NotificationTray {
                                         .mb(px(8.0))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_size(px(13.0))
-                                        .child(format!("{}年{}月", today.year(), today.month())),
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(
+                                                    div()
+                                                        .id("calendar-previous-month")
+                                                        .size(px(22.0))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .rounded(px(5.0))
+                                                        .cursor_pointer()
+                                                        .text_color(theme.muted_foreground)
+                                                        .hover(|style| {
+                                                            style.bg(theme.active_background)
+                                                        })
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.show_previous_calendar_month(cx);
+                                                        }))
+                                                        .child(""),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_size(px(13.0))
+                                                        .child(format!(
+                                                            "{}年{}月",
+                                                            calendar_month.year(),
+                                                            calendar_month.month()
+                                                        )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("calendar-next-month")
+                                                        .size(px(22.0))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .rounded(px(5.0))
+                                                        .cursor_pointer()
+                                                        .text_color(theme.muted_foreground)
+                                                        .hover(|style| {
+                                                            style.bg(theme.active_background)
+                                                        })
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.show_next_calendar_month(cx);
+                                                        }))
+                                                        .child(""),
+                                                ),
+                                        ),
                                 )
                                 .child(div().mb(px(4.0)).flex().children(
                                     WEEKDAY_LABELS.iter().enumerate().map(|(index, label)| {
@@ -930,7 +1014,9 @@ impl Render for NotificationTray {
                                         .children((0..CALENDAR_COLUMNS).map(|weekday| {
                                             let index = week * CALENDAR_COLUMNS + weekday;
                                             let day = calendar_days[index];
-                                            let is_today = day == Some(today.day());
+                                            let is_today = calendar_month.year() == today.year()
+                                                && calendar_month.month() == today.month()
+                                                && day == Some(today.day());
 
                                             div()
                                                 .id(("calendar-day", index as u32))
@@ -995,13 +1081,15 @@ fn control_toggle_button(
                         .font_weight(FontWeight::MEDIUM)
                         .child(title),
                 )
-                .child(
-                    div()
-                        .overflow_hidden()
-                        .text_size(px(10.0))
-                        .text_color(theme.muted_foreground)
-                        .child(status.label.clone()),
-                ),
+                .when(!status.wired, |content| {
+                    content.child(
+                        div()
+                            .overflow_hidden()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .child(status.label.clone()),
+                    )
+                }),
         )
 }
 
@@ -1009,6 +1097,21 @@ fn slider_percent_from_pointer(pointer_x: f32, left: f32, width: f32) -> u8 {
     (((pointer_x - left) / width.max(1.0)) * 100.0)
         .round()
         .clamp(0.0, 100.0) as u8
+}
+
+fn adjacent_calendar_month(month: NaiveDate, direction: i32) -> NaiveDate {
+    debug_assert!(matches!(direction, -1 | 1));
+
+    let (year, month_number) = match (month.month(), direction) {
+        (1, -1) => (month.year() - 1, 12),
+        (12, 1) => (month.year() + 1, 1),
+        (month_number, -1) => (month.year(), month_number - 1),
+        (month_number, 1) => (month.year(), month_number + 1),
+        _ => unreachable!("calendar direction must be one month"),
+    };
+
+    NaiveDate::from_ymd_opt(year, month_number, 1)
+        .expect("adjacent calendar month is within Chrono's date range")
 }
 
 fn calendar_days_for_month(year: i32, month: u32) -> Vec<Option<u32>> {
@@ -1034,7 +1137,21 @@ fn calendar_days_for_month(year: i32, month: u32) -> Vec<Option<u32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{calendar_days_for_month, slider_percent_from_pointer};
+    use chrono::NaiveDate;
+
+    use super::{adjacent_calendar_month, calendar_days_for_month, slider_percent_from_pointer};
+
+    #[test]
+    fn calendar_navigation_crosses_year_boundaries() {
+        assert_eq!(
+            adjacent_calendar_month(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), -1),
+            NaiveDate::from_ymd_opt(2025, 12, 1).unwrap()
+        );
+        assert_eq!(
+            adjacent_calendar_month(NaiveDate::from_ymd_opt(2026, 12, 1).unwrap(), 1),
+            NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()
+        );
+    }
 
     #[test]
     fn calendar_starts_on_the_first_weekday_and_includes_every_day() {

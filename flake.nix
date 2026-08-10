@@ -40,6 +40,7 @@
               vulkan-loader
               libglvnd
               wireplumber
+              ffmpeg
             ];
 
             # GPUI's Wayland renderer loads Vulkan at runtime.  Nix store paths

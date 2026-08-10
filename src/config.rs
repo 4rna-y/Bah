@@ -1,19 +1,24 @@
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Minimal, file-backed settings for the layer surface.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     /// Logical height reserved for the bar.
     pub bar_height: f32,
+    /// Local image (or an animated image) drawn by the wallpaper layer.
+    pub wallpaper: Option<PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { bar_height: 36.0 }
+        Self {
+            bar_height: 36.0,
+            wallpaper: None,
+        }
     }
 }
 
@@ -33,6 +38,23 @@ impl Config {
             bail!("configuration bar_height must be a positive finite number");
         }
         Ok(config)
+    }
+
+    /// Writes the complete configuration, creating its XDG directory when needed.
+    pub fn save(&self) -> Result<()> {
+        let path = config_path()?;
+        let parent = path
+            .parent()
+            .context("configuration path has no parent directory")?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create configuration directory {}",
+                parent.display()
+            )
+        })?;
+        let contents = toml::to_string_pretty(self).context("failed to serialize configuration")?;
+        fs::write(&path, contents)
+            .with_context(|| format!("failed to write configuration file {}", path.display()))
     }
 }
 

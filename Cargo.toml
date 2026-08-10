@@ -10,6 +10,7 @@ chrono = { version = "0.4", default-features = true }
 env_logger = "0.11"
 gpui = { git = "https://github.com/4rna-y/zed", rev = "f005b687a4287536540fe71b898fe63a176ed0d3", default-features = false, features = ["wayland"] }
 gpui_platform = { git = "https://github.com/4rna-y/zed", rev = "f005b687a4287536540fe71b898fe63a176ed0d3", default-features = false, features = ["wayland"] }
+image = "0.25"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

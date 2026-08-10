@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -16,6 +17,10 @@ use zbus::{
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const WORKER_TICK: Duration = Duration::from_millis(50);
+const CPU_STAT_PATH: &str = "/proc/stat";
+const CPU_INFO_PATH: &str = "/proc/cpuinfo";
+const CPU_SYSFS_PATH: &str = "/sys/devices/system/cpu";
+const MEMORY_INFO_PATH: &str = "/proc/meminfo";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioEndpoint {
@@ -45,6 +50,11 @@ pub enum ControlAction {
 pub struct ToggleStatus {
     pub available: bool,
     pub enabled: bool,
+    pub wired: bool,
+    pub signal_strength: Option<u8>,
+    pub interface: Option<String>,
+    pub download_kbps: Option<u64>,
+    pub upload_kbps: Option<u64>,
     pub label: String,
 }
 
@@ -53,6 +63,11 @@ impl ToggleStatus {
         Self {
             available: false,
             enabled: false,
+            wired: false,
+            signal_strength: None,
+            interface: None,
+            download_kbps: None,
+            upload_kbps: None,
             label: "利用不可".to_string(),
         }
     }
@@ -76,12 +91,94 @@ impl LevelStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CpuStatus {
+    pub available: bool,
+    pub percent: u8,
+    pub core_usages: Vec<CpuCoreUsage>,
+}
+
+impl CpuStatus {
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            percent: 0,
+            core_usages: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuCoreUsage {
+    pub index: usize,
+    pub kind: Option<CpuCoreKind>,
+    pub percent_tenths: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuCoreKind {
+    Performance,
+    Efficiency,
+}
+
+impl CpuCoreKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Performance => "P",
+            Self::Efficiency => "E",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryStatus {
+    pub available: bool,
+    pub percent: u8,
+    pub used_kib: u64,
+    pub total_kib: u64,
+}
+
+impl MemoryStatus {
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            percent: 0,
+            used_kib: 0,
+            total_kib: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatteryStatus {
+    pub available: bool,
+    pub percent: u8,
+    pub charging: bool,
+    pub state: String,
+    pub health: String,
+}
+
+impl BatteryStatus {
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            percent: 0,
+            charging: false,
+            state: "不明".to_string(),
+            health: "不明".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlSnapshot {
     pub wifi: ToggleStatus,
     pub bluetooth: ToggleStatus,
+    pub cpu: CpuStatus,
+    pub memory: MemoryStatus,
     pub audio_output: LevelStatus,
     pub audio_input: LevelStatus,
     pub brightness: LevelStatus,
+    pub battery: BatteryStatus,
 }
 
 #[derive(Clone)]
@@ -95,9 +192,12 @@ impl Default for ControlSnapshot {
         Self {
             wifi: ToggleStatus::unavailable(),
             bluetooth: ToggleStatus::unavailable(),
+            cpu: CpuStatus::unavailable(),
+            memory: MemoryStatus::unavailable(),
             audio_output: LevelStatus::unavailable(),
             audio_input: LevelStatus::unavailable(),
             brightness: LevelStatus::unavailable(),
+            battery: BatteryStatus::unavailable(),
         }
     }
 }
@@ -122,7 +222,7 @@ pub fn start_worker() -> ControlChannels {
 }
 
 fn run_worker(actions: Receiver<ControlAction>, snapshots: Sender<ControlSnapshot>) {
-    let backend = SystemBackend::new();
+    let mut backend = SystemBackend::new();
     let mut current = backend.snapshot();
     if snapshots.send_blocking(current.clone()).is_err() {
         return;
@@ -173,6 +273,9 @@ fn run_worker(actions: Receiver<ControlAction>, snapshots: Sender<ControlSnapsho
 struct SystemBackend {
     system_bus: Option<Connection>,
     backlight: Option<BacklightDevice>,
+    battery: Option<BatteryDevice>,
+    network_traffic: NetworkTrafficSampler,
+    cpu_usage: CpuUsageSampler,
 }
 
 impl SystemBackend {
@@ -181,22 +284,33 @@ impl SystemBackend {
             .map_err(|error| warn!("system D-Bus unavailable: {error}"))
             .ok();
         let backlight = select_backlight(Path::new("/sys/class/backlight"));
+        let battery = select_battery(Path::new("/sys/class/power_supply"));
         Self {
             system_bus,
             backlight,
+            battery,
+            network_traffic: NetworkTrafficSampler::default(),
+            cpu_usage: CpuUsageSampler::new(),
         }
     }
 
-    fn snapshot(&self) -> ControlSnapshot {
+    fn snapshot(&mut self) -> ControlSnapshot {
+        let mut wifi = self.wifi_status().unwrap_or_else(|error| {
+            debug!("could not read NetworkManager state: {error}");
+            ToggleStatus::unavailable()
+        });
+        let (download_kbps, upload_kbps) = self.network_traffic.sample(wifi.interface.as_deref());
+        wifi.download_kbps = download_kbps;
+        wifi.upload_kbps = upload_kbps;
+
         ControlSnapshot {
-            wifi: self.wifi_status().unwrap_or_else(|error| {
-                debug!("could not read NetworkManager state: {error}");
-                ToggleStatus::unavailable()
-            }),
+            wifi,
             bluetooth: self.bluetooth_status().unwrap_or_else(|error| {
                 debug!("could not read BlueZ state: {error}");
                 ToggleStatus::unavailable()
             }),
+            cpu: self.cpu_usage.sample(),
+            memory: memory_usage(),
             audio_output: read_wpctl(AudioEndpoint::Output).unwrap_or_else(|error| {
                 debug!("could not read output volume: {error}");
                 LevelStatus::unavailable()
@@ -210,6 +324,11 @@ impl SystemBackend {
                 .as_ref()
                 .and_then(BacklightDevice::status)
                 .unwrap_or_else(LevelStatus::unavailable),
+            battery: self
+                .battery
+                .as_ref()
+                .and_then(BatteryDevice::status)
+                .unwrap_or_else(BatteryStatus::unavailable),
         }
     }
 
@@ -245,6 +364,8 @@ impl SystemBackend {
             .map_err(|error| error.to_string())?;
 
         let mut wifi_label = None;
+        let mut wifi_signal_strength = None;
+        let mut active_interface = None;
         let mut ethernet_active = false;
         for path in devices {
             let device = Proxy::new(
@@ -259,8 +380,12 @@ impl SystemBackend {
             if state != 100 {
                 continue;
             }
+            let interface: String = device.get_property("Interface").unwrap_or_default();
             if kind == 1 {
                 ethernet_active = true;
+                if active_interface.is_none() && !interface.is_empty() {
+                    active_interface = Some(interface);
+                }
             } else if kind == 2 {
                 let wireless = Proxy::new(
                     connection,
@@ -283,23 +408,33 @@ impl SystemBackend {
                     let ssid: Vec<u8> = access_point.get_property("Ssid").unwrap_or_default();
                     if !ssid.is_empty() {
                         wifi_label = Some(String::from_utf8_lossy(&ssid).into_owned());
+                        wifi_signal_strength = access_point.get_property("Strength").ok();
+                        if !interface.is_empty() {
+                            active_interface = Some(interface);
+                        }
                     }
                 }
             }
         }
 
+        let wired = enabled && wifi_label.is_none() && ethernet_active;
         let label = if !enabled {
             "Off".to_string()
         } else if let Some(ssid) = wifi_label {
             ssid
-        } else if ethernet_active {
-            "有線".to_string()
+        } else if wired {
+            "有線接続".to_string()
         } else {
             "未接続".to_string()
         };
         Ok(ToggleStatus {
             available: true,
             enabled,
+            wired,
+            signal_strength: wifi_signal_strength,
+            interface: active_interface,
+            download_kbps: None,
+            upload_kbps: None,
             label,
         })
     }
@@ -358,6 +493,11 @@ impl SystemBackend {
         Ok(ToggleStatus {
             available: true,
             enabled,
+            wired: false,
+            signal_strength: None,
+            interface: None,
+            download_kbps: None,
+            upload_kbps: None,
             label,
         })
     }
@@ -518,13 +658,413 @@ fn select_backlight(root: &Path) -> Option<BacklightDevice> {
         .map(|(_, name, path, max)| BacklightDevice { name, path, max })
 }
 
+#[derive(Clone, Debug)]
+struct BatteryDevice {
+    path: PathBuf,
+}
+
+impl BatteryDevice {
+    fn status(&self) -> Option<BatteryStatus> {
+        let percent = read_u32(&self.path.join("capacity"))?.min(100) as u8;
+        let state = fs::read_to_string(self.path.join("status"))
+            .unwrap_or_else(|_| "Unknown".to_string())
+            .trim()
+            .to_string();
+        let health = fs::read_to_string(self.path.join("health"))
+            .unwrap_or_else(|_| "Unknown".to_string())
+            .trim()
+            .to_string();
+        Some(BatteryStatus {
+            available: true,
+            percent,
+            charging: state == "Charging",
+            state,
+            health,
+        })
+    }
+}
+
+#[derive(Default)]
+struct NetworkTrafficSampler {
+    previous: HashMap<String, (u64, u64, Instant)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CpuTimes {
+    total: u64,
+    idle: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CpuSnapshot {
+    total: CpuTimes,
+    cores: Vec<(usize, CpuTimes)>,
+}
+
+#[derive(Default)]
+struct CpuUsageSampler {
+    previous: Option<CpuSnapshot>,
+    core_kinds: HashMap<usize, CpuCoreKind>,
+}
+
+impl CpuUsageSampler {
+    fn new() -> Self {
+        Self {
+            previous: None,
+            core_kinds: detect_cpu_core_kinds(),
+        }
+    }
+
+    fn sample(&mut self) -> CpuStatus {
+        let status = fs::read_to_string(CPU_STAT_PATH)
+            .ok()
+            .and_then(|stat| parse_cpu_snapshot(&stat))
+            .map(|snapshot| self.sample_snapshot(snapshot));
+        status.unwrap_or_else(CpuStatus::unavailable)
+    }
+
+    fn sample_snapshot(&mut self, current: CpuSnapshot) -> CpuStatus {
+        let previous = self.previous.replace(current.clone());
+        let Some(previous) = previous else {
+            return CpuStatus {
+                available: true,
+                percent: 0,
+                core_usages: Vec::new(),
+            };
+        };
+
+        CpuStatus {
+            available: true,
+            percent: cpu_usage_percent(current.total, previous.total),
+            core_usages: current
+                .cores
+                .iter()
+                .filter_map(|(index, times)| {
+                    previous
+                        .cores
+                        .iter()
+                        .find(|(previous_index, _)| previous_index == index)
+                        .map(|(_, previous_times)| CpuCoreUsage {
+                            index: *index,
+                            kind: self.core_kinds.get(index).copied(),
+                            percent_tenths: cpu_usage_percent_tenths(*times, *previous_times),
+                        })
+                })
+                .collect(),
+        }
+    }
+}
+
+fn parse_cpu_times(stat: &str) -> Option<CpuTimes> {
+    parse_cpu_time_values(stat.lines().find_map(|line| line.strip_prefix("cpu "))?)
+}
+
+fn parse_cpu_snapshot(stat: &str) -> Option<CpuSnapshot> {
+    let total = parse_cpu_times(stat)?;
+    let cores = stat
+        .lines()
+        .filter_map(|line| {
+            let (name, values) = line.split_once(char::is_whitespace)?;
+            let index = name.strip_prefix("cpu")?.parse::<usize>().ok()?;
+            Some((index, parse_cpu_time_values(values)?))
+        })
+        .collect();
+    Some(CpuSnapshot { total, cores })
+}
+
+fn parse_cpu_time_values(values: &str) -> Option<CpuTimes> {
+    let values = values
+        .split_whitespace()
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if values.len() < 4 {
+        return None;
+    }
+
+    let total = values
+        .iter()
+        .take(8)
+        .try_fold(0_u64, |sum, value| sum.checked_add(*value))?;
+    let idle = values[3].checked_add(*values.get(4).unwrap_or(&0))?;
+    Some(CpuTimes { total, idle })
+}
+
+fn cpu_usage_percent(current: CpuTimes, previous: CpuTimes) -> u8 {
+    let total_delta = current.total.saturating_sub(previous.total);
+    if total_delta == 0 {
+        return 0;
+    }
+    let idle_delta = current.idle.saturating_sub(previous.idle);
+    let busy_delta = total_delta.saturating_sub(idle_delta);
+    ((busy_delta * 100 + total_delta / 2) / total_delta).min(100) as u8
+}
+
+fn cpu_usage_percent_tenths(current: CpuTimes, previous: CpuTimes) -> u16 {
+    let total_delta = current.total.saturating_sub(previous.total);
+    if total_delta == 0 {
+        return 0;
+    }
+    let idle_delta = current.idle.saturating_sub(previous.idle);
+    let busy_delta = total_delta.saturating_sub(idle_delta);
+    ((busy_delta * 1_000 + total_delta / 2) / total_delta).min(1_000) as u16
+}
+
+fn detect_cpu_core_kinds() -> HashMap<usize, CpuCoreKind> {
+    if !is_intel_cpu() {
+        return HashMap::new();
+    }
+
+    let thread_counts = fs::read_dir(CPU_SYSFS_PATH)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let index = name.to_str()?.strip_prefix("cpu")?.parse::<usize>().ok()?;
+            let count = fs::read_to_string(entry.path().join("topology/thread_siblings_list"))
+                .ok()
+                .and_then(|cpus| cpu_list_count(&cpus))?;
+            Some((index, count))
+        })
+        .collect::<Vec<_>>();
+
+    classify_cpu_core_kinds(&thread_counts)
+}
+
+fn is_intel_cpu() -> bool {
+    fs::read_to_string(CPU_INFO_PATH).is_ok_and(|cpuinfo| {
+        cpuinfo.lines().any(|line| {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            name.trim() == "vendor_id" && value.trim() == "GenuineIntel"
+        })
+    })
+}
+
+fn classify_cpu_core_kinds(thread_counts: &[(usize, usize)]) -> HashMap<usize, CpuCoreKind> {
+    let has_smt_core = thread_counts.iter().any(|(_, count)| *count > 1);
+    let has_single_thread_core = thread_counts.iter().any(|(_, count)| *count == 1);
+    if !has_smt_core || !has_single_thread_core {
+        return HashMap::new();
+    }
+
+    thread_counts
+        .iter()
+        .filter_map(|(index, count)| match count {
+            1 => Some((*index, CpuCoreKind::Efficiency)),
+            _ if *count > 1 => Some((*index, CpuCoreKind::Performance)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn cpu_list_count(cpus: &str) -> Option<usize> {
+    cpus.trim().split(',').try_fold(0_usize, |count, item| {
+        let (start, end) = match item.split_once('-') {
+            Some((start, end)) => (start.parse::<usize>().ok()?, end.parse::<usize>().ok()?),
+            None => {
+                let index = item.parse::<usize>().ok()?;
+                (index, index)
+            }
+        };
+        end.checked_sub(start)?.checked_add(1)?.checked_add(count)
+    })
+}
+
+fn memory_usage() -> MemoryStatus {
+    fs::read_to_string(MEMORY_INFO_PATH)
+        .ok()
+        .and_then(|meminfo| parse_memory_usage(&meminfo))
+        .unwrap_or_else(MemoryStatus::unavailable)
+}
+
+fn parse_memory_usage(meminfo: &str) -> Option<MemoryStatus> {
+    let mut total_kib = None;
+    let mut available_kib = None;
+    for line in meminfo.lines() {
+        let (name, value) = line.split_once(':')?;
+        let value_kib = value.split_whitespace().next()?.parse::<u64>().ok()?;
+        match name {
+            "MemTotal" => total_kib = Some(value_kib),
+            "MemAvailable" => available_kib = Some(value_kib),
+            _ => {}
+        }
+    }
+
+    let total_kib = total_kib?;
+    let available_kib = available_kib?;
+    if total_kib == 0 {
+        return None;
+    }
+    let used_kib = total_kib.saturating_sub(available_kib);
+    Some(MemoryStatus {
+        available: true,
+        percent: ((used_kib * 100 + total_kib / 2) / total_kib).min(100) as u8,
+        used_kib,
+        total_kib,
+    })
+}
+
+impl NetworkTrafficSampler {
+    fn sample(&mut self, interface: Option<&str>) -> (Option<u64>, Option<u64>) {
+        let Some(interface) = interface else {
+            self.previous.clear();
+            return (None, None);
+        };
+        let root = Path::new("/sys/class/net")
+            .join(interface)
+            .join("statistics");
+        let Some(download_bytes) = read_u64(&root.join("rx_bytes")) else {
+            return (None, None);
+        };
+        let Some(upload_bytes) = read_u64(&root.join("tx_bytes")) else {
+            return (None, None);
+        };
+        let now = Instant::now();
+        let previous = self
+            .previous
+            .insert(interface.to_string(), (download_bytes, upload_bytes, now));
+        let Some((previous_download, previous_upload, previous_at)) = previous else {
+            return (None, None);
+        };
+        let seconds = now.duration_since(previous_at).as_secs_f64();
+        if seconds == 0.0 || download_bytes < previous_download || upload_bytes < previous_upload {
+            return (None, None);
+        }
+        let to_kbps = |bytes| ((bytes as f64 * 8.0) / seconds / 1_000.0).round() as u64;
+        (
+            Some(to_kbps(download_bytes - previous_download)),
+            Some(to_kbps(upload_bytes - previous_upload)),
+        )
+    }
+}
+
+fn select_battery(root: &Path) -> Option<BatteryDevice> {
+    let mut batteries = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            (fs::read_to_string(path.join("type")).ok()?.trim() == "Battery")
+                .then_some((entry.file_name().to_string_lossy().into_owned(), path))
+        })
+        .collect::<Vec<_>>();
+    batteries.sort_by(|left, right| left.0.cmp(&right.0));
+    batteries
+        .into_iter()
+        .next()
+        .map(|(_, path)| BatteryDevice { path })
+}
+
 fn read_u32(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn read_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioEndpoint, LevelStatus, bluetooth_label, parse_wpctl_volume};
+    use std::collections::HashMap;
+
+    use super::{
+        AudioEndpoint, CpuCoreKind, CpuCoreUsage, CpuStatus, CpuTimes, CpuUsageSampler,
+        LevelStatus, MemoryStatus, bluetooth_label, classify_cpu_core_kinds, cpu_list_count,
+        parse_cpu_snapshot, parse_cpu_times, parse_memory_usage, parse_wpctl_volume,
+    };
+
+    #[test]
+    fn calculates_cpu_usage_from_consecutive_proc_stat_samples() {
+        let mut sampler = CpuUsageSampler::default();
+        assert_eq!(
+            sampler.sample_snapshot(
+                parse_cpu_snapshot(
+                    "cpu  100 0 0 700 0 0 0 0\n\
+                     cpu0 50 0 0 300 0 0 0 0\n\
+                     cpu1 50 0 0 400 0 0 0 0\n",
+                )
+                .unwrap(),
+            ),
+            CpuStatus {
+                available: true,
+                percent: 0,
+                core_usages: vec![],
+            }
+        );
+        assert_eq!(
+            sampler.sample_snapshot(
+                parse_cpu_snapshot(
+                    "cpu  160 0 0 740 0 0 0 0\n\
+                     cpu0 90 0 0 320 0 0 0 0\n\
+                     cpu1 70 0 0 420 0 0 0 0\n",
+                )
+                .unwrap(),
+            ),
+            CpuStatus {
+                available: true,
+                percent: 60,
+                core_usages: vec![
+                    CpuCoreUsage {
+                        index: 0,
+                        kind: None,
+                        percent_tenths: 667,
+                    },
+                    CpuCoreUsage {
+                        index: 1,
+                        kind: None,
+                        percent_tenths: 500,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_cpu_time_fields_without_counting_guest_time_twice() {
+        assert_eq!(
+            parse_cpu_times("cpu  10 20 30 40 50 60 70 80 90 100\n"),
+            Some(CpuTimes {
+                total: 360,
+                idle: 90,
+            })
+        );
+    }
+
+    #[test]
+    fn classifies_mixed_intel_thread_topology_as_p_and_e_cores() {
+        assert_eq!(
+            classify_cpu_core_kinds(&[(0, 2), (1, 2), (2, 1), (3, 1)]),
+            HashMap::from([
+                (0, CpuCoreKind::Performance),
+                (1, CpuCoreKind::Performance),
+                (2, CpuCoreKind::Efficiency),
+                (3, CpuCoreKind::Efficiency),
+            ])
+        );
+        assert!(classify_cpu_core_kinds(&[(0, 2), (1, 2)]).is_empty());
+    }
+
+    #[test]
+    fn counts_ranges_in_cpu_sibling_lists() {
+        assert_eq!(cpu_list_count("0-3,8,10-11\n"), Some(7));
+    }
+
+    #[test]
+    fn calculates_memory_usage_from_mem_available() {
+        assert_eq!(
+            parse_memory_usage("MemTotal:       1000 kB\nMemAvailable:    365 kB\n"),
+            Some(MemoryStatus {
+                available: true,
+                percent: 64,
+                used_kib: 635,
+                total_kib: 1000,
+            })
+        );
+    }
 
     #[test]
     fn parses_wpctl_volume_and_mute() {
