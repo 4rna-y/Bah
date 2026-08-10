@@ -16,7 +16,7 @@ use log::warn;
 use crate::{
     modules::notifications::{NotificationEvent, NotificationStore, SharedNotificationStore},
     modules::system_controls::{
-        AudioEndpoint, ControlAction, ControlSnapshot, LevelStatus, ToggleStatus,
+        AudioEndpoint, ControlAction, ControlSnapshot, LevelStatus, NetworkKind, ToggleStatus,
     },
     theme::{BarTheme, ui_font},
 };
@@ -115,7 +115,7 @@ impl NotificationTray {
         cx: &mut Context<Self>,
     ) -> Self {
         let today = Local::now().date_naive();
-        let tray = Self {
+        Self {
             notifications,
             updates,
             control_actions,
@@ -131,8 +131,7 @@ impl NotificationTray {
             slider_drag: None,
             calendar_month: NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
                 .expect("current date has a valid month"),
-        };
-        tray
+        }
     }
 
     pub(crate) fn set_controls(&mut self, controls: ControlSnapshot, cx: &mut Context<Self>) {
@@ -689,7 +688,12 @@ impl Render for NotificationTray {
                     .flex_none(),
             );
 
-        let (network_icon, network_title) = if wifi.wired {
+        let (network_icon, network_title) = if self
+            .controls
+            .primary_network
+            .as_ref()
+            .is_some_and(|route| route.kind == NetworkKind::Wired)
+        {
             ("󰈀", "有線接続")
         } else {
             ("", "Wi-Fi")

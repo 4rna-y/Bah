@@ -6,6 +6,7 @@ mod device_control_center;
 mod hyprland;
 mod memory_usage;
 mod modules;
+mod network_popover;
 mod notification_tray;
 mod theme;
 mod wallpaper;

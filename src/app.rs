@@ -2,8 +2,9 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Read, Write},
     os::fd::AsRawFd,
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -16,7 +17,7 @@ use gpui::{
     WindowKind, WindowOptions, layer_shell::*, point, px,
 };
 use gpui_platform::application;
-use log::{error, info};
+use log::{error, info, warn};
 
 use crate::{
     bar::Bar,
@@ -34,6 +35,7 @@ use crate::{
 
 const CONFIG_WINDOW_LOCK_FILE: &str = "bah/config-window.lock";
 const DEVICE_CONTROL_CENTER_LOCK_FILE: &str = "bah/device-control-center.lock";
+const DEVICE_CONTROL_CENTER_SOCKET_FILE: &str = "bah/device-control-center.sock";
 const WALLPAPER_LOCK_FILE: &str = "bah/wallpaper.lock";
 const WALLPAPER_PID_FILE: &str = "bah/wallpaper.pid";
 const USAGE: &str = "usage: bah [--memusg] [--wgpu-backend BACKENDS] [--vk-driver-files PATH] \
@@ -142,15 +144,136 @@ fn validate_wgpu_backend(value: &OsStr) -> Result<(), String> {
     }
 }
 
+fn decode_hex_ssid(value: &OsStr) -> Result<Vec<u8>, String> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("--ssid-hex must be valid UTF-8\n{USAGE}"))?;
+    if value.is_empty() || value.len() % 2 != 0 {
+        return Err(format!(
+            "--ssid-hex must contain complete byte pairs\n{USAGE}"
+        ));
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&value[offset..offset + 2], 16))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| format!("--ssid-hex must be hexadecimal\n{USAGE}"))
+}
+
+fn encode_hex_ssid(ssid: &[u8]) -> String {
+    ssid.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Opens the network page without blocking a UI render callback.
+pub fn launch_device_control_center_network(ssid: Option<Vec<u8>>) {
+    let _ = thread::Builder::new()
+        .name("bah-device-control-center-launch".to_string())
+        .spawn(move || {
+            let executable = match env::current_exe() {
+                Ok(executable) => executable,
+                Err(error) => {
+                    error!("could not resolve current executable: {error}");
+                    return;
+                }
+            };
+            let mut command = Command::new(executable);
+            command.args(["window", "device-control-center", "network"]);
+            if let Some(ssid) = ssid {
+                command.args(["--ssid-hex", &encode_hex_ssid(&ssid)]);
+            }
+            if let Err(error) = command.spawn() {
+                error!("failed to launch device control center: {error}");
+            }
+        });
+}
+
+fn device_control_center_socket_path() -> io::Result<PathBuf> {
+    runtime_lock_path(DEVICE_CONTROL_CENTER_SOCKET_FILE)
+}
+
+fn write_device_control_center_route(route: &DeviceControlCenterRoute) -> io::Result<()> {
+    let mut stream = UnixStream::connect(device_control_center_socket_path()?)?;
+    let payload = route
+        .ssid
+        .as_deref()
+        .map(encode_hex_ssid)
+        .unwrap_or_default();
+    stream.write_all(payload.as_bytes())?;
+    stream.write_all(b"\n")
+}
+
+fn start_device_control_center_route_server(
+    sender: async_channel::Sender<DeviceControlCenterRoute>,
+) -> io::Result<DeviceControlCenterRouteServer> {
+    let path = device_control_center_socket_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // The singleton lock is held before removing this exact per-user socket,
+    // so a stale endpoint from a crashed previous instance is safe to replace.
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+    let listener = UnixListener::bind(&path)?;
+    let worker = listener.try_clone()?;
+    thread::Builder::new()
+        .name("bah-device-control-center-route".to_string())
+        .spawn(move || {
+            for stream in worker.incoming().flatten() {
+                let mut request = String::new();
+                let mut stream = stream;
+                if stream.read_to_string(&mut request).is_err() {
+                    continue;
+                }
+                let ssid = match request.trim() {
+                    "" => None,
+                    value => match decode_hex_ssid(OsStr::new(value)) {
+                        Ok(ssid) => Some(ssid),
+                        Err(error) => {
+                            warn!("invalid device control center route: {error}");
+                            continue;
+                        }
+                    },
+                };
+                if sender
+                    .send_blocking(DeviceControlCenterRoute { ssid })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })?;
+    Ok(DeviceControlCenterRouteServer {
+        _listener: listener,
+        path,
+    })
+}
+
+pub struct DeviceControlCenterRouteServer {
+    _listener: UnixListener,
+    path: PathBuf,
+}
+
+impl Drop for DeviceControlCenterRouteServer {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Selects which surface this invocation creates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunMode {
     Bar,
     ConfigWindow,
-    DeviceControlCenter,
+    DeviceControlCenter(DeviceControlCenterRoute),
     Wallpaper,
     WallpaperSet(PathBuf),
     WallpaperUnset,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct DeviceControlCenterRoute {
+    pub ssid: Option<Vec<u8>>,
 }
 
 impl RunMode {
@@ -169,7 +292,28 @@ impl RunMode {
             [window, device_control_center]
                 if window == "window" && device_control_center == "device-control-center" =>
             {
-                Ok(Self::DeviceControlCenter)
+                Ok(Self::DeviceControlCenter(
+                    DeviceControlCenterRoute::default(),
+                ))
+            }
+            [window, device_control_center, network]
+                if window == "window"
+                    && device_control_center == "device-control-center"
+                    && network == "network" =>
+            {
+                Ok(Self::DeviceControlCenter(
+                    DeviceControlCenterRoute::default(),
+                ))
+            }
+            [window, device_control_center, network, flag, ssid]
+                if window == "window"
+                    && device_control_center == "device-control-center"
+                    && network == "network"
+                    && flag == "--ssid-hex" =>
+            {
+                Ok(Self::DeviceControlCenter(DeviceControlCenterRoute {
+                    ssid: Some(decode_hex_ssid(ssid)?),
+                }))
             }
             [wallpaper] if wallpaper == "wallpaper" => Ok(Self::Wallpaper),
             [wallpaper, set, path] if wallpaper == "wallpaper" && set == "set" => {
@@ -188,7 +332,7 @@ pub fn run(mode: RunMode, config: Config) {
     match mode {
         RunMode::Bar => run_bar(config),
         RunMode::ConfigWindow => run_config_window(config),
-        RunMode::DeviceControlCenter => run_device_control_center(),
+        RunMode::DeviceControlCenter(route) => run_device_control_center(route),
         RunMode::Wallpaper => run_wallpaper(config),
         RunMode::WallpaperSet(_) | RunMode::WallpaperUnset => {
             unreachable!("commands exit before run")
@@ -420,15 +564,30 @@ fn run_bar(config: Config) {
     });
 }
 
-fn run_device_control_center() {
+fn run_device_control_center(route: DeviceControlCenterRoute) {
     let lock = match DeviceControlCenterLock::acquire() {
         Ok(Some(lock)) => lock,
         Ok(None) => {
-            info!("a device control center window is already open; ignoring this invocation");
+            for _ in 0..20 {
+                if write_device_control_center_route(&route).is_ok() {
+                    info!("routed request to existing device control center window");
+                    return;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            warn!("a device control center window is already open but cannot receive routes");
             return;
         }
         Err(error) => {
             error!("could not lock device control center window: {error}");
+            return;
+        }
+    };
+    let (route_sender, route_receiver) = async_channel::unbounded();
+    let route_server = match start_device_control_center_route_server(route_sender) {
+        Ok(server) => server,
+        Err(error) => {
+            error!("could not start device control center route server: {error}");
             return;
         }
     };
@@ -453,7 +612,11 @@ fn run_device_control_center() {
                 window_min_size: Some(Size::new(px(480.0), px(320.0))),
                 ..Default::default()
             },
-            move |_, cx| cx.new(|cx| DeviceControlCenter::new(lock, cx)),
+            move |_, cx| {
+                cx.new(|cx| {
+                    DeviceControlCenter::new(lock, route.clone(), route_receiver, route_server, cx)
+                })
+            },
         );
 
         match result {
@@ -483,7 +646,7 @@ fn run_config_window(config: Config) {
     };
 
     application().run(move |cx: &mut App| {
-        let size = Size::new(px(520.0), px(360.0));
+        let size = Size::new(px(900.0), px(650.0));
         let result = cx.open_window(
             WindowOptions {
                 titlebar: Some(gpui::TitlebarOptions {
@@ -499,14 +662,17 @@ fn run_config_window(config: Config) {
                 app_id: Some("bah-settings".to_string()),
                 window_decorations: Some(WindowDecorations::Server),
                 window_bounds: Some(WindowBounds::centered(size, cx)),
-                window_min_size: Some(Size::new(px(400.0), px(280.0))),
+                window_min_size: Some(Size::new(px(480.0), px(320.0))),
                 ..Default::default()
             },
             move |_, cx| cx.new(|cx| ConfigWindow::new(config, lock, cx)),
         );
 
         match result {
-            Ok(_) => info!("configuration window created"),
+            Ok(_) => {
+                hyprland::force_float_window_for_process("bah-settings", std::process::id());
+                info!("configuration window created")
+            }
             Err(error) => error!("failed to create configuration window: {error}"),
         }
     });
@@ -640,7 +806,7 @@ const SIGTERM: i32 = 15;
 
 #[cfg(test)]
 mod tests {
-    use super::{RunMode, StartupOptions};
+    use super::{DeviceControlCenterRoute, RunMode, StartupOptions};
 
     #[test]
     fn parses_supported_invocations() {
@@ -651,7 +817,21 @@ mod tests {
         );
         assert_eq!(
             RunMode::from_args(["window", "device-control-center"]),
-            Ok(RunMode::DeviceControlCenter)
+            Ok(RunMode::DeviceControlCenter(
+                DeviceControlCenterRoute::default(),
+            ))
+        );
+        assert_eq!(
+            RunMode::from_args([
+                "window",
+                "device-control-center",
+                "network",
+                "--ssid-hex",
+                "77696669",
+            ]),
+            Ok(RunMode::DeviceControlCenter(DeviceControlCenterRoute {
+                ssid: Some(b"wifi".to_vec()),
+            }))
         );
         assert_eq!(RunMode::from_args(["wallpaper"]), Ok(RunMode::Wallpaper));
         assert_eq!(

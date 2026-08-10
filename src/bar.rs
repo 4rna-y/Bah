@@ -1,11 +1,11 @@
-use std::{sync::MutexGuard, time::Duration};
+use std::{cell::RefCell, rc::Rc, sync::MutexGuard, time::Duration};
 
 use async_channel::{Receiver, Sender};
 
 use gpui::{
     App, Bounds, Context, FontWeight, InteractiveElement, MouseDownEvent, Pixels, Point, Render,
     Size, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle,
-    WindowKind, WindowOptions, div, img, layer_shell::*, point, popup::*, prelude::*, px,
+    WindowKind, WindowOptions, canvas, div, img, layer_shell::*, point, popup::*, prelude::*, px,
 };
 use log::{error, info, warn};
 
@@ -19,10 +19,11 @@ use crate::{
         notifications::{NotificationEvent, NotificationStore, SharedNotificationStore},
         system_controls::{
             BatteryStatus, ControlChannels, ControlSnapshot, CpuStatus, LevelStatus, MemoryStatus,
-            ToggleStatus,
+            NetworkKind, NetworkRoute, ToggleStatus,
         },
         workspaces::Workspaces,
     },
+    network_popover::{NetworkPopover, window_size as network_popover_window_size},
     notification_tray::{NotificationTray, NotificationTrayDismissTarget, TRAY_PANEL_WIDTH_RATIO},
     theme::{BarTheme, ui_font},
 };
@@ -42,6 +43,8 @@ pub struct Bar {
     status_tooltip_popup: Option<WindowHandle<StatusTooltip>>,
     notification_tray: Option<WindowHandle<NotificationTray>>,
     notification_tray_dismiss_target: Option<WindowHandle<NotificationTrayDismissTarget>>,
+    network_popover: Option<WindowHandle<NetworkPopover>>,
+    network_icon_bounds: Rc<RefCell<Bounds<Pixels>>>,
     controls: ControlChannels,
     control_snapshot: ControlSnapshot,
 }
@@ -80,10 +83,12 @@ fn volume_icon(status: LevelStatus) -> &'static str {
     }
 }
 
-fn network_icon(status: &ToggleStatus) -> &'static str {
-    if status.wired {
+fn network_icon(status: &ToggleStatus, route: Option<&NetworkRoute>) -> &'static str {
+    if !status.available || route.is_none() {
+        "\u{f092c}"
+    } else if route.is_some_and(|route| route.kind == NetworkKind::Wired) {
         "\u{f0200}"
-    } else if !status.enabled || !status.available {
+    } else if !status.enabled {
         "\u{f092c}"
     } else {
         match status.signal_strength.unwrap_or(100) {
@@ -292,6 +297,8 @@ impl Bar {
             status_tooltip_popup: None,
             notification_tray: None,
             notification_tray_dismiss_target: None,
+            network_popover: None,
+            network_icon_bounds: Rc::new(RefCell::new(Bounds::default())),
             controls,
             control_snapshot: ControlSnapshot::default(),
         };
@@ -299,6 +306,7 @@ impl Bar {
         Self::start_ipc_updates(ipc_updates, cx);
         Self::start_notification_updates(notification_updates, cx);
         Self::start_control_updates(bar.controls.updates.clone(), cx);
+        Self::start_wifi_events(bar.controls.wifi_events.clone(), cx);
         bar
     }
 
@@ -366,6 +374,30 @@ impl Bar {
         .detach();
     }
 
+    fn start_wifi_events(
+        events: Receiver<crate::modules::system_controls::WifiConnectionEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |bar, cx| {
+            while let Ok(event) = events.recv().await {
+                if bar
+                    .update(cx, |bar, cx| {
+                        if let Some(popover) = bar.network_popover {
+                            let _ = popover.update(cx, |popover, window, cx| {
+                                popover.apply_wifi_event(event.clone(), window, cx);
+                            });
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
     fn start_control_updates(updates: Receiver<ControlSnapshot>, cx: &mut Context<Self>) {
         cx.spawn(async move |bar, cx| {
             while let Ok(snapshot) = updates.recv().await {
@@ -375,6 +407,11 @@ impl Bar {
                         if let Some(tray) = bar.notification_tray {
                             let _ = tray.update(cx, |tray, _, cx| {
                                 tray.set_controls(snapshot.clone(), cx);
+                            });
+                        }
+                        if let Some(popover) = bar.network_popover {
+                            let _ = popover.update(cx, |popover, window, cx| {
+                                popover.set_controls(snapshot.clone(), window, cx);
                             });
                         }
                         bar.refresh_status_tooltip(cx);
@@ -660,6 +697,78 @@ impl Bar {
         }
     }
 
+    fn show_network_popover(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(popover) = self.network_popover {
+            if popover.update(cx, |_, _, _| {}).is_ok() {
+                self.close_network_popover(cx);
+                return;
+            }
+            self.network_popover = None;
+        }
+        self.close_status_tooltip(cx);
+        let size = network_popover_window_size(&self.control_snapshot, &[]);
+        let parent = window.window_handle();
+        let measured_anchor = *self.network_icon_bounds.borrow();
+        let anchor_rect = if measured_anchor.size.width > px(0.0) {
+            measured_anchor
+        } else {
+            // This fallback is only possible before the first prepaint.
+            Bounds {
+                origin: point(event.position.x - px(12.0), event.position.y - px(12.0)),
+                size: Size::new(px(24.0), px(24.0)),
+            }
+        };
+        let actions = self.controls.actions.clone();
+        let theme = self.theme;
+        let controls = self.control_snapshot.clone();
+        match cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                focus: true,
+                app_id: Some("bah-network-popover".to_string()),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size,
+                })),
+                kind: WindowKind::AnchoredPopup(PopupOptions {
+                    parent,
+                    anchor_rect,
+                    anchor: PopupAnchor::Bottom,
+                    gravity: PopupGravity::Bottom,
+                    constraint_adjustment: PopupConstraintAdjustment::SLIDE_X,
+                    offset: point(px(0.0), px(2.0)),
+                    grab: true,
+                }),
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|_| NetworkPopover::new(controls, actions, theme)),
+        ) {
+            Ok(popover) => {
+                self.network_popover = Some(popover);
+                let _ = self.controls.actions.try_send(
+                    crate::modules::system_controls::ControlAction::SetWifiDiscovery(true),
+                );
+            }
+            Err(error) => warn!("failed to open network popover: {error}"),
+        }
+    }
+
+    fn close_network_popover(&mut self, cx: &mut Context<Self>) {
+        if let Some(popover) = self.network_popover.take() {
+            let _ = popover.update(cx, |_, window, _| window.remove_window());
+        }
+        let _ = self
+            .controls
+            .actions
+            .try_send(crate::modules::system_controls::ControlAction::SetWifiDiscovery(false));
+    }
+
     fn status_tooltip_text(&self, id: &str) -> String {
         match id {
             "cpu" => cpu_usage_tooltip(self.control_snapshot.cpu.clone()),
@@ -756,7 +865,9 @@ impl Render for Bar {
         let theme = self.theme;
         let notification_count = self.notification_store().count();
         let volume_icon = volume_icon(self.control_snapshot.audio_output);
-        let network_icon = network_icon(&self.control_snapshot.wifi);
+        let primary_network = self.control_snapshot.primary_network.as_ref();
+        let network_icon = network_icon(&self.control_snapshot.wifi, primary_network);
+        let network_icon_bounds = self.network_icon_bounds.clone();
         let battery_icon = battery_icon(&self.control_snapshot.battery);
         let cpu_usage = if self.control_snapshot.cpu.available {
             format!("{}%", self.control_snapshot.cpu.percent)
@@ -772,11 +883,12 @@ impl Render for Bar {
         let volume_icon_size = status_icon_size * VOLUME_ICON_SCALE;
         let cpu_icon_size = status_icon_size * CPU_ICON_SCALE;
         let memory_icon_size = status_icon_size * MEMORY_ICON_SCALE;
-        let network_icon_size = if self.control_snapshot.wifi.wired {
-            status_icon_size * ETHERNET_ICON_SCALE
-        } else {
-            status_icon_size
-        };
+        let network_icon_size =
+            if primary_network.is_some_and(|route| route.kind == NetworkKind::Wired) {
+                status_icon_size * ETHERNET_ICON_SCALE
+            } else {
+                status_icon_size
+            };
         let left = self
             .workspaces
             .as_ref()
@@ -808,6 +920,7 @@ impl Render for Bar {
             .relative()
             .on_any_mouse_down(cx.listener(|this, _, window, cx| {
                 this.hide_jump_list(window, cx);
+                this.close_network_popover(cx);
             }))
             .child(
                 div()
@@ -894,6 +1007,7 @@ impl Render for Bar {
                             .child(
                                 div()
                                     .id("status-network")
+                                    .relative()
                                     .size(px(STATUS_ICON_FRAME_SIZE))
                                     .flex()
                                     .items_center()
@@ -904,7 +1018,24 @@ impl Render for Bar {
                                             "network", *hovered, window, cx,
                                         );
                                     }))
-                                    .child(network_icon),
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(|this, event, window, cx| {
+                                            this.show_network_popover(event, window, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child(network_icon)
+                                    .child(
+                                        canvas(
+                                            move |bounds, _, _| {
+                                                *network_icon_bounds.borrow_mut() = bounds;
+                                            },
+                                            |_, _, _, _| {},
+                                        )
+                                        .absolute()
+                                        .inset_0(),
+                                    ),
                             )
                             .child(
                                 div()
@@ -1086,14 +1217,46 @@ fn notification_badge_label(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cpu_usage_tooltip, memory_usage_tooltip, notification_badge_label};
-    use crate::modules::system_controls::{CpuCoreKind, CpuCoreUsage, CpuStatus, MemoryStatus};
+    use super::{cpu_usage_tooltip, memory_usage_tooltip, network_icon, notification_badge_label};
+    use crate::modules::system_controls::{
+        CpuCoreKind, CpuCoreUsage, CpuStatus, MemoryStatus, NetworkKind, NetworkRoute, ToggleStatus,
+    };
+
+    fn network_status(signal_strength: Option<u8>) -> ToggleStatus {
+        ToggleStatus {
+            available: true,
+            enabled: true,
+            wired: false,
+            signal_strength,
+            interface: None,
+            download_kbps: None,
+            upload_kbps: None,
+            label: String::new(),
+        }
+    }
 
     #[test]
     fn notification_badge_caps_large_counts() {
         assert_eq!(notification_badge_label(1), "1");
         assert_eq!(notification_badge_label(99), "99");
         assert_eq!(notification_badge_label(100), "99+");
+    }
+
+    #[test]
+    fn network_icon_uses_the_selected_default_route() {
+        let status = network_status(Some(100));
+        let ethernet = NetworkRoute {
+            kind: NetworkKind::Wired,
+            interface: "eth0".to_string(),
+        };
+        let wifi = NetworkRoute {
+            kind: NetworkKind::Wifi,
+            interface: "wlan0".to_string(),
+        };
+
+        assert_eq!(network_icon(&status, Some(&ethernet)), "\u{f0200}");
+        assert_eq!(network_icon(&status, Some(&wifi)), "\u{f0928}");
+        assert_eq!(network_icon(&status, None), "\u{f092c}");
     }
 
     #[test]
