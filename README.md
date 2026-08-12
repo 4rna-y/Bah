@@ -10,8 +10,10 @@
 - アクティブなWorkspaceを右クリックすると、フォーカス中アプリのDesktop Entryが宣言する`Actions`（LinuxのJump List / Quicklist標準）を表示し、選択したアクションを起動します。`Actions`を宣言していないアプリではメニューを表示しません。
 - 右側の `YYYY-MM-DD HH:MM:SS` 時計。1秒ごとにGPUI Entityを更新します。
 - 時計の右側に通知ボタンを表示し、未処理通知数をバッジで表示します。クリックすると画面右端に固定された、画面幅の35%・画面高の通知トレイを右からスライドインで開きます。
-- 通知トレイ上部にWi-Fi、Bluetooth、既定の音声出力・入力、画面輝度のコントロールを表示します。Wi-FiとBluetoothは左クリックでOn/Off、右クリックでデバイスコントロールセンターを開きます。音量・輝度スライダーはドラッグ中に現在値を表示します。
-- `org.freedesktop.Notifications` のセッションD-Busサービスとして通知を受信し、トレイで個別削除または一括削除できます。既存の通知デーモンが同名サービスを所有している場合は、そのデーモンとの競合を避けて通知受信を無効にします。
+- 通知トレイ上部にWi-Fi、Bluetooth、既定の音声出力・入力、画面輝度のコントロールを表示します。Wi-FiとBluetoothは左クリックでOn/Off、右クリックで対応するデバイスコントロールセンターのページを開きます。音量・輝度スライダーはドラッグ中に現在値を表示します。
+- 接続中のAirPodsはBluetoothとは別のアイコンで表示し、Popoverから左右平均の充電リングとTransparency／Adaptive／Noise Cancellationを操作できます。Bluetooth DCCには左右個別の残量と同じモード切替を表示します。
+- `org.freedesktop.Notifications` のセッションD-Busサービスとして通知を受信し、右上（バー直下）の一時ポップアップとトレイへ表示します。アクション、期限、緊急度、進捗、置換、同期スタックタグ、履歴、通知一時停止に対応します。既存の通知デーモンが同名サービスを所有している場合は、そのデーモンとの競合を避けて通知受信を無効にします。
+- `bah notifications` は dunstctl と同じ主要操作（close、history、count、pause、rule、reloadなど）を提供します。Cargo パッケージには既存のキーバインドを移行できる `dunstctl` 互換エントリも含まれます。
 - `.socket.sock` による初期ワークスペース取得と、`.socket2.sock` のworkspace/focused-monitorイベントによる更新
 - IPCが利用不能でも、時計だけを表示して起動継続
 
@@ -44,13 +46,14 @@ RUST_LOG=info cargo run -- window config
 ./bah
 ./bah window config
 ./bah window device-control-center
+./bah window device-control-center bluetooth
 ```
 
-`window device-control-center` は現段階では空の通常Windowだけを表示します。通知トレイのWi-Fi／Bluetooth右クリック、または音声入出力のデバイス選択ボタンからも起動できます。Hyprland上では、BahがPIDと`app_id`で自ウィンドウを特定してfloat dispatcherを送るため、個別のWindow Ruleや`Hyprland.lua`設定なしで浮動表示されます。
+`window device-control-center` はネットワークページを、`window device-control-center bluetooth` はBluetoothページをBarへ要求してAnchoredPopupで開きます。Barが起動している必要があります。Bluetoothページでは電源切替、接続済み／ペアリング済み機器の接続・切断、周辺機器の探索、新規機器のPIN・確認コードを使ったペアリングと接続を行えます。
 
 ## デバイスコントロールの動作環境
 
-通知トレイのデバイスコントロールは、NetworkManager、BlueZ、PipeWire/WirePlumber、systemd-logind、およびLinux backlight sysfsを使用します。音声操作にはWirePlumber付属の`wpctl`が実行時に必要です。利用できないサービスやデバイスは個別に「利用不可」と表示され、通知トレイのほかの機能は継続動作します。
+通知トレイのデバイスコントロールは、NetworkManager、BlueZ、PipeWire/WirePlumber、systemd-logind、およびLinux backlight sysfsを使用します。AirPods機能には、ペアリング済みAirPodsとBlueZのAACP L2CAP接続権限が必要です。音声操作にはWirePlumber付属の`wpctl`が実行時に必要です。利用できないサービスやデバイスは個別に「利用不可」と表示され、通知トレイのほかの機能は継続動作します。
 
 - AudioOut: PipeWireの既定Audio Sink
 - AudioIn: PipeWireの既定Audio Source
@@ -76,7 +79,47 @@ RUST_LOG=debug cargo run
 bar_height = 36.0
 # `bah wallpaper set` により絶対パスが書き込まれます。
 # wallpaper = "/home/user/Pictures/wallpaper.png"
+# DCCのディスプレイページで設定する出力別の壁紙です。
+# [wallpapers]
+# DP-1 = "/home/user/Pictures/external.png"
+
+[notifications]
+# dunst の既定値と同じ上限・履歴数。critical_timeout_seconds = 0 は手動で閉じるまで表示します。
+popup_width = 360.0
+notification_limit = 20
+history_length = 20
+low_timeout_seconds = 10
+normal_timeout_seconds = 10
+critical_timeout_seconds = 0
+pause_level = 0
+
+[[notifications.rules]]
+name = "quiet-network"
+enabled = true
+app_name = "NetworkManager アプレット"
+skip_popup = true
 ```
+
+## 通知デーモンの移行
+
+Bah が通知D-Bus名を所有する必要があるため、Hyprlandの起動設定から `dunst` を外し、代わりに `bah` を起動してください。現在の設定では次の行を置き換えます。
+
+```lua
+-- hl.exec_cmd("dunst")
+hl.exec_cmd("bah")
+```
+
+同じセッションでdunstがすでに実行中なら、Bahを起動する前に終了します。通知操作は次のように行えます。
+
+```bash
+bah notifications count
+bah notifications set-paused toggle
+bah notifications history
+# 互換エントリをインストール済みの場合も同じ操作です。
+dunstctl close-all
+```
+
+`reload` はdunstrcではなくBahのTOMLを再読込します。ルールは上から順に適用され、`app_name`、`summary`、`category`、`desktop_entry`、`urgency`で照合して、期限、pause override、ポップアップ抑止、履歴除外、スタックタグを変更できます。
 
 ## 壁紙
 
@@ -89,7 +132,15 @@ bar_height = 36.0
 
 `set` はパスを正規化して設定ファイルへ保存し、既存のBah壁紙Layerを終了して新しいLayerをバックグラウンドで起動します。`unset` は設定を削除してLayerを終了します。壁紙Layerだけを（設定済みのパスで）起動したいときは `./bah wallpaper` を使えます。
 
+通常の `bah` 起動時も、共通または出力別の壁紙が設定済みなら壁紙Layerを自動で起動します。
+
 静止画形式（PNG、JPEG、WebPなど）に加え、GIFとアニメーションWebPでは各デコード済みフレームを順に描画します。MP4、WebM、MKV、AVI、MOV、M4VはFFmpegでデコードし、30fpsでLayerへ渡します。動画は音声なしで繰り返し再生されます。Nix開発環境にはFFmpegを含めています。Nix環境外で実行する場合は、`ffmpeg`と`ffprobe`を`PATH`から実行可能にしてください。
+
+## ディスプレイ
+
+`bah window device-control-center display`、またはDCCの「ディスプレイ」ページから、接続中のモニターをドラッグして配置できます。選択したモニターを「メインモニターにする」と、当該モニターを`0x0`に固定したまま他モニターの相対位置を維持します。適用時には`~/.config/hypr/bah_displays.lua`を生成し、`hyprland.lua`へBah管理の`require("bah_displays")`を追加します。workspace 1はメインモニターへ割り当てられます。
+
+壁紙は出力ごとに選択できます。個別設定がない出力は従来の共通`wallpaper`を使用します。
 
 ## 視認性と外観
 
@@ -197,5 +248,5 @@ GPUIはcrates.io版ではなく、forkしたZedの[`wgpu-backend` ブランチ](
 
 - 1つのLayer Surfaceをデフォルト出力へ作成します。マルチモニタごとのバー生成は未実装です。
 - Waylandには実行中アプリの任意のアプリ内メニューを他プロセスが取得する共通プロトコルはありません。このため右クリックメニューはDesktop Entry仕様の`Actions`に限定されます。これはアプリパッケージが提供するJump List / Quicklistの標準形式です。
-- 音量、ネットワーク、Bluetooth、システムトレイ、設定画面、動的プラグインは未実装です。
+- 音量のデバイス選択、Bluetooth機器の解除、システムトレイ、設定画面、動的プラグインは未実装です。
 - IPCイベントワーカーの再接続は未実装です。接続断はログへ出力され、時計は継続します。

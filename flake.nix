@@ -19,6 +19,7 @@
             wayland
             vulkan-loader
             libglvnd
+            dbus
           ];
         in
         {
@@ -31,6 +32,7 @@
               clippy
               git
               pkg-config
+              dbus
               fontconfig
               nerd-fonts.jetbrains-mono
               noto-fonts-cjk-sans
@@ -41,6 +43,7 @@
               libglvnd
               wireplumber
               ffmpeg
+              zenity
             ];
 
             # GPUI's Wayland renderer loads Vulkan at runtime.  Nix store paths

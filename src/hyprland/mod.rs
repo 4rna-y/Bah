@@ -1,4 +1,5 @@
 mod client;
+pub mod display;
 pub mod events;
 mod icons;
 mod jump_list;

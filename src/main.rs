@@ -1,3 +1,4 @@
+mod airpods_popover;
 mod app;
 mod bar;
 mod config;
@@ -7,11 +8,55 @@ mod hyprland;
 mod memory_usage;
 mod modules;
 mod network_popover;
+mod notification_popup;
 mod notification_tray;
 mod theme;
 mod wallpaper;
 
-use log::{error, info};
+use std::{
+    env, fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
+
+use log::{LevelFilter, error, info};
+
+/// Sends each log record to the terminal and the persistent per-user log.
+struct TeeWriter {
+    stdout: io::Stdout,
+    file: fs::File,
+}
+
+impl Write for TeeWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stdout.write_all(buffer)?;
+        self.file.write_all(buffer)?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stdout.flush()?;
+        self.file.flush()
+    }
+}
+
+fn log_file_path() -> PathBuf {
+    if let Some(path) = env::var_os("BAH_LOG_FILE") {
+        return PathBuf::from(path);
+    }
+    let state_home = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    state_home.join("bah/bah.log")
+}
+
+fn open_log_file(path: &Path) -> io::Result<fs::File> {
+    if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    fs::OpenOptions::new().create(true).append(true).open(path)
+}
 
 fn main() {
     let options = match app::StartupOptions::from_environment() {
@@ -37,13 +82,32 @@ fn main() {
     }
 
     let mut logger = env_logger::Builder::from_default_env();
+    // zbus emits one INFO entry for every NetworkManager proxy cache. Keep
+    // application-level INFO logs useful without flooding the journal.
+    logger.filter_module("zbus", LevelFilter::Warn);
     if options.memory_usage && std::env::var_os("RUST_LOG").is_none() {
         logger.filter_module("bah::memory_usage", log::LevelFilter::Info);
+    }
+    let log_path = log_file_path();
+    match open_log_file(&log_path) {
+        Ok(file) => {
+            logger.target(env_logger::Target::Pipe(Box::new(TeeWriter {
+                stdout: io::stdout(),
+                file,
+            })));
+        }
+        Err(error) => {
+            eprintln!(
+                "bah: could not open log file {}: {error}",
+                log_path.display()
+            );
+        }
     }
     logger.init();
     memory_usage::start_if_enabled();
 
     info!("starting bah");
+    info!("log file: {}", log_path.display());
     info!(
         "Wayland display: {}",
         std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_string())

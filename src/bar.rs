@@ -10,13 +10,17 @@ use gpui::{
 use log::{error, info, warn};
 
 use crate::{
+    airpods_popover::{AirPodsPopover, window_size as airpods_popover_window_size},
     hyprland::{
         IpcUpdate, JumpListAction, WorkspaceWindow, close_window, launch_jump_list_action,
         switch_to_workspace,
     },
     modules::{
         clock::Clock,
-        notifications::{NotificationEvent, NotificationStore, SharedNotificationStore},
+        notifications::{
+            CloseReason, NotificationEvent, NotificationStore, SharedNotificationStore,
+            emit_notification_closed,
+        },
         system_controls::{
             BatteryStatus, ControlChannels, ControlSnapshot, CpuStatus, LevelStatus, MemoryStatus,
             NetworkKind, NetworkRoute, ToggleStatus,
@@ -24,6 +28,7 @@ use crate::{
         workspaces::Workspaces,
     },
     network_popover::{NetworkPopover, window_size as network_popover_window_size},
+    notification_popup::NotificationPopupStack,
     notification_tray::{NotificationTray, NotificationTrayDismissTarget, TRAY_PANEL_WIDTH_RATIO},
     theme::{BarTheme, ui_font},
 };
@@ -43,7 +48,15 @@ pub struct Bar {
     status_tooltip_popup: Option<WindowHandle<StatusTooltip>>,
     notification_tray: Option<WindowHandle<NotificationTray>>,
     notification_tray_dismiss_target: Option<WindowHandle<NotificationTrayDismissTarget>>,
+    notification_popup: Option<WindowHandle<NotificationPopupStack>>,
     network_popover: Option<WindowHandle<NetworkPopover>>,
+    device_control_center: Option<WindowHandle<crate::device_control_center::DeviceControlCenter>>,
+    device_control_center_anchor: WindowHandle<DeviceControlCenterAnchor>,
+    _device_control_center_route_server: crate::app::DeviceControlCenterRouteServer,
+    pending_device_control_center_route: Option<crate::app::DeviceControlCenterRoute>,
+    airpods_popover: Option<WindowHandle<AirPodsPopover>>,
+    airpods_icon_bounds: Rc<RefCell<Bounds<Pixels>>>,
+    bluetooth_icon_bounds: Rc<RefCell<Bounds<Pixels>>>,
     network_icon_bounds: Rc<RefCell<Bounds<Pixels>>>,
     controls: ControlChannels,
     control_snapshot: ControlSnapshot,
@@ -53,14 +66,18 @@ const JUMP_MENU_ROW_HEIGHT: f32 = 28.0;
 const JUMP_MENU_WIDTH: f32 = 220.0;
 const JUMP_MENU_BORDER_WIDTH: f32 = 1.0;
 const STATUS_ICON_FRAME_SIZE: f32 = 24.0;
-const VOLUME_ICON_SCALE: f32 = 20.0 / 13.0;
-const ETHERNET_ICON_SCALE: f32 = 20.0 / 13.0;
+// The status glyphs come from JetBrainsMono Nerd Font Mono. Their outlines
+// have different heights even when rendered at the same text size, so scale
+// each selected glyph to the 928-unit height of the regular battery glyph.
+const STATUS_ICON_REFERENCE_VISIBLE_HEIGHT: f32 = 928.0;
+const STATUS_ICON_UNITS_PER_EM: f32 = 1000.0;
 // Scale the MDI glyphs to the same 12.1px visible height as `md-battery`
 // at the bar's standard 13px status-icon size.
 const CPU_ICON_SCALE: f32 = 1.74;
 const MEMORY_ICON_SCALE: f32 = 1.55;
 const CPU_ICON: &str = "\u{f061a}";
 const MEMORY_ICON: &str = "\u{f035b}";
+const BLUETOOTH_ICON: &str = "\u{f293}";
 const STATUS_TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const STATUS_TOOLTIP_FONT_SIZE: f32 = 11.0;
 const STATUS_TOOLTIP_LINE_HEIGHT: f32 = 17.0;
@@ -68,68 +85,108 @@ const STATUS_TOOLTIP_HORIZONTAL_PADDING: f32 = 8.0;
 const STATUS_TOOLTIP_VERTICAL_PADDING: f32 = 5.0;
 const STATUS_TOOLTIP_BORDER_WIDTH: f32 = 1.0;
 const STATUS_TOOLTIP_ASCII_CHARACTER_WIDTH: f32 = 8.0;
+const DEVICE_CONTROL_CENTER_WIDTH: f32 = 900.0;
+const DEVICE_CONTROL_CENTER_HEIGHT: f32 = 650.0;
 
-fn volume_icon(status: LevelStatus) -> &'static str {
-    if !status.available {
-        "\u{f0581}"
-    } else if status.muted || status.percent == 0 {
-        "\u{f075f}"
-    } else if status.percent <= 33 {
-        "\u{f057f}"
-    } else if status.percent <= 66 {
-        "\u{f0580}"
-    } else {
-        "\u{f057e}"
+/// A full-monitor, transparent surface used only as the stable Wayland parent
+/// for the device-control-center popup.
+pub struct DeviceControlCenterAnchor;
+
+impl Render for DeviceControlCenterAnchor {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_input_region(Some(&[]));
+        div().size_full()
     }
 }
 
-fn network_icon(status: &ToggleStatus, route: Option<&NetworkRoute>) -> &'static str {
+#[derive(Clone, Copy, Debug)]
+struct StatusIcon {
+    glyph: &'static str,
+    visible_height: f32,
+}
+
+impl StatusIcon {
+    const fn new(glyph: &'static str, visible_height: f32) -> Self {
+        Self {
+            glyph,
+            visible_height,
+        }
+    }
+
+    fn scale(self) -> f32 {
+        STATUS_ICON_REFERENCE_VISIBLE_HEIGHT / self.visible_height
+    }
+
+    fn text_size(self, base_size: Pixels) -> Pixels {
+        base_size * self.scale()
+    }
+}
+
+fn volume_icon(status: LevelStatus) -> StatusIcon {
+    if !status.available {
+        StatusIcon::new("\u{f0581}", 600.0)
+    } else if status.muted || status.percent == 0 {
+        StatusIcon::new("\u{f075f}", 508.0)
+    } else if status.percent <= 33 {
+        StatusIcon::new("\u{f057f}", 928.0)
+    } else if status.percent <= 66 {
+        StatusIcon::new("\u{f0580}", 712.0)
+    } else {
+        StatusIcon::new("\u{f057e}", 584.0)
+    }
+}
+
+fn network_icon(status: &ToggleStatus, route: Option<&NetworkRoute>) -> StatusIcon {
     if !status.available || route.is_none() {
-        "\u{f092c}"
+        StatusIcon::new("\u{f092c}", 488.0)
     } else if route.is_some_and(|route| route.kind == NetworkKind::Wired) {
-        "\u{f0200}"
+        StatusIcon::new("\u{f0200}", 572.0)
     } else if !status.enabled {
-        "\u{f092c}"
+        StatusIcon::new("\u{f092c}", 488.0)
     } else {
         match status.signal_strength.unwrap_or(100) {
-            0..=25 => "\u{f091f}",
-            26..=50 => "\u{f0922}",
-            51..=75 => "\u{f0925}",
-            _ => "\u{f0928}",
+            0..=25 => StatusIcon::new("\u{f091f}", 476.0),
+            26..=50 => StatusIcon::new("\u{f0922}", 476.0),
+            51..=75 => StatusIcon::new("\u{f0925}", 476.0),
+            _ => StatusIcon::new("\u{f0928}", 476.0),
         }
     }
 }
 
-fn battery_icon(status: &BatteryStatus) -> &'static str {
+fn bluetooth_icon_visible(status: &ToggleStatus) -> bool {
+    status.available && status.enabled && status.connected
+}
+
+fn battery_icon(status: &BatteryStatus) -> StatusIcon {
     let percent = status.percent;
     if !status.available {
-        return "\u{f0091}";
+        return StatusIcon::new("\u{f0091}", 928.0);
     }
     if status.charging {
         return match percent {
-            0..=10 => "\u{f0084}",
-            11..=20 => "\u{f0086}",
-            21..=30 => "\u{f0087}",
-            31..=40 => "\u{f0088}",
-            41..=50 => "\u{f0089}",
-            51..=60 => "\u{f008a}",
-            61..=70 => "\u{f008b}",
-            71..=80 => "\u{f008c}",
-            81..=90 => "\u{f008d}",
-            _ => "\u{f0085}",
+            0..=10 => StatusIcon::new("\u{f0084}", 928.0),
+            11..=20 => StatusIcon::new("\u{f0086}", 570.0),
+            21..=30 => StatusIcon::new("\u{f0087}", 570.0),
+            31..=40 => StatusIcon::new("\u{f0088}", 570.0),
+            41..=50 => StatusIcon::new("\u{f0089}", 570.0),
+            51..=60 => StatusIcon::new("\u{f008a}", 570.0),
+            61..=70 => StatusIcon::new("\u{f008b}", 570.0),
+            71..=80 => StatusIcon::new("\u{f008c}", 928.0),
+            81..=90 => StatusIcon::new("\u{f008d}", 544.0),
+            _ => StatusIcon::new("\u{f0085}", 570.0),
         };
     }
     match percent {
-        0..=10 => "\u{f007a}",
-        11..=20 => "\u{f007b}",
-        21..=30 => "\u{f007c}",
-        31..=40 => "\u{f007d}",
-        41..=50 => "\u{f007e}",
-        51..=60 => "\u{f007f}",
-        61..=70 => "\u{f0080}",
-        71..=80 => "\u{f0081}",
-        81..=90 => "\u{f0082}",
-        _ => "\u{f0079}",
+        0..=10 => StatusIcon::new("\u{f007a}", 928.0),
+        11..=20 => StatusIcon::new("\u{f007b}", 928.0),
+        21..=30 => StatusIcon::new("\u{f007c}", 928.0),
+        31..=40 => StatusIcon::new("\u{f007d}", 928.0),
+        41..=50 => StatusIcon::new("\u{f007e}", 928.0),
+        51..=60 => StatusIcon::new("\u{f007f}", 928.0),
+        61..=70 => StatusIcon::new("\u{f0080}", 928.0),
+        71..=80 => StatusIcon::new("\u{f0081}", 928.0),
+        81..=90 => StatusIcon::new("\u{f0082}", 928.0),
+        _ => StatusIcon::new("\u{f0079}", 928.0),
     }
 }
 
@@ -195,6 +252,14 @@ fn network_usage_tooltip(status: &ToggleStatus) -> String {
         rate(status.download_kbps),
         rate(status.upload_kbps),
     )
+}
+
+fn bluetooth_usage_tooltip(status: &ToggleStatus) -> String {
+    if status.available && status.connected {
+        format!("Bluetooth\n{}", status.label)
+    } else {
+        "Bluetooth: 未接続".to_string()
+    }
 }
 
 fn battery_usage_tooltip(status: &BatteryStatus) -> String {
@@ -274,12 +339,16 @@ struct WorkspaceMenu {
 }
 
 impl Bar {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ipc_updates: Receiver<IpcUpdate>,
         notification_updates: Receiver<NotificationEvent>,
         notification_sender: Sender<NotificationEvent>,
         notifications: SharedNotificationStore,
         controls: ControlChannels,
+        device_control_center_routes: Receiver<crate::app::DeviceControlCenterRoute>,
+        device_control_center_route_server: crate::app::DeviceControlCenterRouteServer,
+        device_control_center_anchor: WindowHandle<DeviceControlCenterAnchor>,
         theme: BarTheme,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -297,8 +366,16 @@ impl Bar {
             status_tooltip_popup: None,
             notification_tray: None,
             notification_tray_dismiss_target: None,
+            notification_popup: None,
             network_popover: None,
+            device_control_center: None,
+            device_control_center_anchor,
+            _device_control_center_route_server: device_control_center_route_server,
+            pending_device_control_center_route: None,
+            airpods_popover: None,
             network_icon_bounds: Rc::new(RefCell::new(Bounds::default())),
+            airpods_icon_bounds: Rc::new(RefCell::new(Bounds::default())),
+            bluetooth_icon_bounds: Rc::new(RefCell::new(Bounds::default())),
             controls,
             control_snapshot: ControlSnapshot::default(),
         };
@@ -307,7 +384,30 @@ impl Bar {
         Self::start_notification_updates(notification_updates, cx);
         Self::start_control_updates(bar.controls.updates.clone(), cx);
         Self::start_wifi_events(bar.controls.wifi_events.clone(), cx);
+        Self::start_bluetooth_events(bar.controls.bluetooth_events.clone(), cx);
+        Self::start_network_settings_events(bar.controls.network_settings_events.clone(), cx);
+        Self::start_device_control_center_routes(device_control_center_routes, cx);
         bar
+    }
+
+    fn start_device_control_center_routes(
+        routes: Receiver<crate::app::DeviceControlCenterRoute>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |bar, cx| {
+            while let Ok(route) = routes.recv().await {
+                if bar
+                    .update(cx, |bar, cx| {
+                        bar.pending_device_control_center_route = Some(route);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     fn start_clock(cx: &mut Context<Self>) {
@@ -316,6 +416,13 @@ impl Bar {
                 if bar
                     .update(cx, |bar, cx| {
                         bar.clock.tick();
+                        let expired = bar.notification_store().expire(std::time::Instant::now());
+                        for id in expired {
+                            emit_notification_closed(id, CloseReason::Expired);
+                        }
+                        if let Some(popup) = bar.notification_popup {
+                            let _ = popup.update(cx, |_, _, cx| cx.notify());
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -354,14 +461,25 @@ impl Bar {
                 if bar
                     .update(cx, |bar, cx| {
                         let mut notifications = bar.notification_store();
-                        notifications.apply(first_update);
+                        // D-Bus Notify applies to the shared store before it
+                        // wakes the UI. Tray-originated close/clear events are
+                        // still applied here on the GPUI thread.
+                        if !matches!(first_update, NotificationEvent::Upsert(_)) {
+                            notifications.apply(first_update);
+                        }
                         while let Ok(update) = updates.try_recv() {
-                            notifications.apply(update);
+                            if !matches!(update, NotificationEvent::Upsert(_)) {
+                                notifications.apply(update);
+                            }
                         }
                         drop(notifications);
 
                         if let Some(tray) = bar.notification_tray {
                             let _ = tray.update(cx, |_, _, cx| cx.notify());
+                        }
+                        bar.show_notification_popup(cx);
+                        if let Some(popup) = bar.notification_popup {
+                            let _ = popup.update(cx, |_, _, cx| cx.notify());
                         }
                         cx.notify();
                     })
@@ -385,6 +503,59 @@ impl Bar {
                         if let Some(popover) = bar.network_popover {
                             let _ = popover.update(cx, |popover, window, cx| {
                                 popover.apply_wifi_event(event.clone(), window, cx);
+                            });
+                        }
+                        if let Some(center) = bar.device_control_center {
+                            let _ = center.update(cx, |center, _, cx| {
+                                center.apply_wifi_update(event.clone(), cx);
+                            });
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_bluetooth_events(
+        events: Receiver<crate::modules::system_controls::BluetoothEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |bar, cx| {
+            while let Ok(event) = events.recv().await {
+                if bar
+                    .update(cx, |bar, cx| {
+                        if let Some(center) = bar.device_control_center {
+                            let _ = center.update(cx, |center, _, cx| {
+                                center.apply_bluetooth_update(event.clone(), cx);
+                            });
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_network_settings_events(
+        events: Receiver<crate::modules::system_controls::NetworkSettingsEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |bar, cx| {
+            while let Ok(event) = events.recv().await {
+                if bar
+                    .update(cx, |bar, cx| {
+                        if let Some(center) = bar.device_control_center {
+                            let _ = center.update(cx, |center, _, cx| {
+                                center.apply_network_settings_update(event.clone(), cx);
                             });
                         }
                         cx.notify();
@@ -413,6 +584,19 @@ impl Bar {
                             let _ = popover.update(cx, |popover, window, cx| {
                                 popover.set_controls(snapshot.clone(), window, cx);
                             });
+                        }
+                        if let Some(center) = bar.device_control_center {
+                            let _ = center.update(cx, |center, _, cx| {
+                                center.set_snapshot(snapshot.clone(), cx);
+                            });
+                        }
+                        if let Some(popover) = bar.airpods_popover {
+                            let _ = popover.update(cx, |popover, window, cx| {
+                                popover.set_controls(snapshot.clone(), window, cx);
+                            });
+                        }
+                        if !snapshot.airpods.connected {
+                            bar.close_airpods_popover(cx);
                         }
                         bar.refresh_status_tooltip(cx);
                         cx.notify();
@@ -453,6 +637,59 @@ impl Bar {
         self.notifications
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn show_notification_popup(&mut self, cx: &mut Context<Self>) {
+        if let Some(popup) = self.notification_popup {
+            let _ = popup.update(cx, |_, _, cx| cx.notify());
+            return;
+        }
+        let store = self.notification_store();
+        if !store.config().enabled {
+            return;
+        }
+        let displayed_count = store.displayed_count();
+        if displayed_count == 0 {
+            return;
+        }
+        let popup_width = store.config().popup_width;
+        drop(store);
+        let popup_height = NotificationPopupStack::height_for(displayed_count);
+        let notifications = self.notifications.clone();
+        let sender = self.notification_sender.clone();
+        let theme = self.theme;
+        match cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                focus: false,
+                show: true,
+                is_movable: false,
+                is_resizable: false,
+                app_id: Some("bah-notification-popup".to_string()),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_decorations: Some(WindowDecorations::Client),
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: Size::new(px(popup_width), px(popup_height)),
+                })),
+                kind: WindowKind::LayerShell(LayerShellOptions {
+                    namespace: "bah-notification-popup".to_string(),
+                    layer: Layer::Overlay,
+                    anchor: Anchor::TOP | Anchor::RIGHT,
+                    exclusive_zone: Some(px(0.0)),
+                    keyboard_interactivity: KeyboardInteractivity::None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|_| NotificationPopupStack::new(notifications, sender, theme)),
+        ) {
+            Ok(popup) => {
+                self.notification_popup = Some(popup);
+                info!("notification popup surface opened");
+            }
+            Err(error) => error!("failed to create notification popup: {error}"),
+        }
     }
 
     fn show_notification_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -769,11 +1006,189 @@ impl Bar {
             .try_send(crate::modules::system_controls::ControlAction::SetWifiDiscovery(false));
     }
 
+    fn show_airpods_popover(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(popover) = self.airpods_popover {
+            if popover.update(cx, |_, _, _| {}).is_ok() {
+                self.close_airpods_popover(cx);
+                return;
+            }
+            self.airpods_popover = None;
+        }
+        self.close_status_tooltip(cx);
+        let measured_anchor = *self.airpods_icon_bounds.borrow();
+        let anchor_rect = if measured_anchor.size.width > px(0.0) {
+            measured_anchor
+        } else {
+            Bounds {
+                origin: point(event.position.x - px(12.0), event.position.y - px(12.0)),
+                size: Size::new(px(24.0), px(24.0)),
+            }
+        };
+        let parent = window.window_handle();
+        let actions = self.controls.actions.clone();
+        let controls = self.control_snapshot.clone();
+        let theme = self.theme;
+        match cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                focus: true,
+                app_id: Some("bah-airpods-popover".to_string()),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: airpods_popover_window_size(),
+                })),
+                kind: WindowKind::AnchoredPopup(PopupOptions {
+                    parent,
+                    anchor_rect,
+                    anchor: PopupAnchor::Bottom,
+                    gravity: PopupGravity::Bottom,
+                    constraint_adjustment: PopupConstraintAdjustment::SLIDE_X
+                        | PopupConstraintAdjustment::FLIP_Y,
+                    offset: point(px(0.0), px(2.0)),
+                    grab: true,
+                }),
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|_| AirPodsPopover::new(controls, actions, theme)),
+        ) {
+            Ok(popover) => self.airpods_popover = Some(popover),
+            Err(error) => warn!("failed to open AirPods popover: {error}"),
+        }
+    }
+
+    fn close_airpods_popover(&mut self, cx: &mut Context<Self>) {
+        if let Some(popover) = self.airpods_popover.take() {
+            let _ = popover.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
+    fn show_device_control_center(
+        &mut self,
+        page: crate::app::DeviceControlCenterPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(center) = self.device_control_center {
+            if center.update(cx, |_, _, _| {}).is_ok() {
+                self.close_device_control_center(cx);
+                return;
+            }
+            self.device_control_center = None;
+        }
+        self.close_status_tooltip(cx);
+        self.close_network_popover(cx);
+        self.close_airpods_popover(cx);
+        self.open_device_control_center(page, None, window, cx);
+    }
+
+    fn open_device_control_center(
+        &mut self,
+        page: crate::app::DeviceControlCenterPage,
+        ssid: Option<Vec<u8>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let route = crate::app::DeviceControlCenterRoute { page, ssid };
+        let controls = self.controls.clone();
+        let snapshot = self.control_snapshot.clone();
+        let parent = self.device_control_center_anchor.into();
+        let display_size = window
+            .display(cx)
+            .map_or(window.viewport_size(), |display| display.bounds().size);
+        let anchor_size = self
+            .device_control_center_anchor
+            .update(cx, |_, anchor_window, _| anchor_window.viewport_size())
+            .unwrap_or(display_size);
+        let popover_top_left = point(
+            anchor_size.width / 2.0 - px(DEVICE_CONTROL_CENTER_WIDTH / 2.0),
+            anchor_size.height / 2.0 - px(DEVICE_CONTROL_CENTER_HEIGHT / 2.0),
+        );
+        match cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                focus: true,
+                app_id: Some("bah-device-control-center".to_string()),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: Size::new(
+                        px(DEVICE_CONTROL_CENTER_WIDTH),
+                        px(DEVICE_CONTROL_CENTER_HEIGHT),
+                    ),
+                })),
+                kind: WindowKind::AnchoredPopup(PopupOptions {
+                    parent,
+                    anchor_rect: Bounds {
+                        origin: point(anchor_size.width / 2.0, anchor_size.height / 2.0),
+                        size: Size::new(px(1.0), px(1.0)),
+                    },
+                    anchor: PopupAnchor::Center,
+                    gravity: PopupGravity::Center,
+                    constraint_adjustment: PopupConstraintAdjustment::SLIDE_X
+                        | PopupConstraintAdjustment::SLIDE_Y,
+                    offset: Point::default(),
+                    grab: true,
+                }),
+                ..Default::default()
+            },
+            move |_, cx| {
+                cx.new(|cx| {
+                    crate::device_control_center::DeviceControlCenter::new_popover(
+                        controls, snapshot, route, cx,
+                    )
+                })
+            },
+        ) {
+            Ok(center) => {
+                info!(
+                    "device control center popover opened: left_top=({:.1}, {:.1}), size=({:.1}, {:.1}), output=({:.1}, {:.1}), anchor=({:.1}, {:.1}), scale={:.2}",
+                    f32::from(popover_top_left.x),
+                    f32::from(popover_top_left.y),
+                    DEVICE_CONTROL_CENTER_WIDTH,
+                    DEVICE_CONTROL_CENTER_HEIGHT,
+                    f32::from(display_size.width),
+                    f32::from(display_size.height),
+                    f32::from(anchor_size.width),
+                    f32::from(anchor_size.height),
+                    window.scale_factor(),
+                );
+                self.device_control_center = Some(center);
+            }
+            Err(error) => warn!("failed to open device control center: {error}"),
+        }
+    }
+
+    fn show_device_control_center_route(
+        &mut self,
+        route: crate::app::DeviceControlCenterRoute,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_device_control_center(cx);
+        self.close_status_tooltip(cx);
+        self.close_network_popover(cx);
+        self.close_airpods_popover(cx);
+        self.open_device_control_center(route.page, route.ssid, window, cx);
+    }
+
+    fn close_device_control_center(&mut self, cx: &mut Context<Self>) {
+        if let Some(center) = self.device_control_center.take() {
+            let _ = center.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
     fn status_tooltip_text(&self, id: &str) -> String {
         match id {
             "cpu" => cpu_usage_tooltip(self.control_snapshot.cpu.clone()),
             "memory" => memory_usage_tooltip(self.control_snapshot.memory),
             "volume" => volume_usage_tooltip(self.control_snapshot.audio_output),
+            "bluetooth" => bluetooth_usage_tooltip(&self.control_snapshot.bluetooth),
             "network" => network_usage_tooltip(&self.control_snapshot.wifi),
             "battery" => battery_usage_tooltip(&self.control_snapshot.battery),
             _ => "利用不可".to_string(),
@@ -858,6 +1273,9 @@ impl Bar {
 
 impl Render for Bar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(route) = self.pending_device_control_center_route.take() {
+            self.show_device_control_center_route(route, window, cx);
+        }
         if self.jump_menu_resize_pending {
             self.resize_for_jump_menu(window, cx);
             self.jump_menu_resize_pending = false;
@@ -867,6 +1285,10 @@ impl Render for Bar {
         let volume_icon = volume_icon(self.control_snapshot.audio_output);
         let primary_network = self.control_snapshot.primary_network.as_ref();
         let network_icon = network_icon(&self.control_snapshot.wifi, primary_network);
+        let bluetooth_icon_visible = bluetooth_icon_visible(&self.control_snapshot.bluetooth);
+        let bluetooth_icon_bounds = self.bluetooth_icon_bounds.clone();
+        let airpods_icon_visible = self.control_snapshot.airpods.connected;
+        let airpods_icon_bounds = self.airpods_icon_bounds.clone();
         let network_icon_bounds = self.network_icon_bounds.clone();
         let battery_icon = battery_icon(&self.control_snapshot.battery);
         let cpu_usage = if self.control_snapshot.cpu.available {
@@ -880,15 +1302,13 @@ impl Render for Bar {
             "—%".to_string()
         };
         let status_icon_size = theme.clock_font_size;
-        let volume_icon_size = status_icon_size * VOLUME_ICON_SCALE;
+        let bluetooth_icon_size = status_icon_size + px(2.0);
+        let airpods_icon_size = status_icon_size + px(3.0);
+        let volume_icon_size = volume_icon.text_size(status_icon_size);
         let cpu_icon_size = status_icon_size * CPU_ICON_SCALE;
         let memory_icon_size = status_icon_size * MEMORY_ICON_SCALE;
-        let network_icon_size =
-            if primary_network.is_some_and(|route| route.kind == NetworkKind::Wired) {
-                status_icon_size * ETHERNET_ICON_SCALE
-            } else {
-                status_icon_size
-            };
+        let network_icon_size = network_icon.text_size(status_icon_size);
+        let battery_icon_size = battery_icon.text_size(status_icon_size);
         let left = self
             .workspaces
             .as_ref()
@@ -921,6 +1341,8 @@ impl Render for Bar {
             .on_any_mouse_down(cx.listener(|this, _, window, cx| {
                 this.hide_jump_list(window, cx);
                 this.close_network_popover(cx);
+                this.close_airpods_popover(cx);
+                this.close_device_control_center(cx);
             }))
             .child(
                 div()
@@ -1002,8 +1424,85 @@ impl Render for Bar {
                                             "volume", *hovered, window, cx,
                                         );
                                     }))
-                                    .child(volume_icon),
+                                    .child(volume_icon.glyph),
                             )
+                            .when(bluetooth_icon_visible, |status| {
+                                status.child(
+                                    div()
+                                        .id("status-bluetooth")
+                                        .size(px(STATUS_ICON_FRAME_SIZE))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(bluetooth_icon_size)
+                                        .on_hover(cx.listener(move |this, hovered, window, cx| {
+                                            this.set_status_tooltip_hovered(
+                                                "bluetooth",
+                                                *hovered,
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(|this, _event, window, cx| {
+                                                this.show_device_control_center(
+                                                    crate::app::DeviceControlCenterPage::Bluetooth,
+                                                    window,
+                                                    cx,
+                                                );
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child(BLUETOOTH_ICON)
+                                        .child(
+                                            canvas(
+                                                move |bounds, _, _| {
+                                                    *bluetooth_icon_bounds.borrow_mut() = bounds;
+                                                },
+                                                |_, _, _, _| {},
+                                            )
+                                            .absolute()
+                                            .inset_0(),
+                                        ),
+                                )
+                            })
+                            .when(airpods_icon_visible, |status| {
+                                status.child(
+                                    div()
+                                        .id("status-airpods")
+                                        .relative()
+                                        .size(px(STATUS_ICON_FRAME_SIZE))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(|this, event, window, cx| {
+                                                this.show_airpods_popover(event, window, cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .child(
+                                            img(std::path::PathBuf::from(env!(
+                                                "CARGO_MANIFEST_DIR"
+                                            ))
+                                            .join("src/icon/airpods_icon.svg"))
+                                            .size(airpods_icon_size),
+                                        )
+                                        .child(
+                                            canvas(
+                                                move |bounds, _, _| {
+                                                    *airpods_icon_bounds.borrow_mut() = bounds;
+                                                },
+                                                |_, _, _, _| {},
+                                            )
+                                            .absolute()
+                                            .inset_0(),
+                                        ),
+                                )
+                            })
                             .child(
                                 div()
                                     .id("status-network")
@@ -1025,7 +1524,7 @@ impl Render for Bar {
                                             cx.stop_propagation();
                                         }),
                                     )
-                                    .child(network_icon)
+                                    .child(network_icon.glyph)
                                     .child(
                                         canvas(
                                             move |bounds, _, _| {
@@ -1044,13 +1543,13 @@ impl Render for Bar {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_size(status_icon_size)
+                                    .text_size(battery_icon_size)
                                     .on_hover(cx.listener(move |this, hovered, window, cx| {
                                         this.set_status_tooltip_hovered(
                                             "battery", *hovered, window, cx,
                                         );
                                     }))
-                                    .child(battery_icon),
+                                    .child(battery_icon.glyph),
                             )
                             .child(
                                 div()
@@ -1217,15 +1716,22 @@ fn notification_badge_label(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cpu_usage_tooltip, memory_usage_tooltip, network_icon, notification_badge_label};
-    use crate::modules::system_controls::{
-        CpuCoreKind, CpuCoreUsage, CpuStatus, MemoryStatus, NetworkKind, NetworkRoute, ToggleStatus,
+    use super::{
+        STATUS_ICON_REFERENCE_VISIBLE_HEIGHT, STATUS_ICON_UNITS_PER_EM, StatusIcon, battery_icon,
+        bluetooth_icon_visible, cpu_usage_tooltip, memory_usage_tooltip, network_icon,
+        notification_badge_label, volume_icon,
     };
+    use crate::modules::system_controls::{
+        BatteryStatus, CpuCoreKind, CpuCoreUsage, CpuStatus, LevelStatus, MemoryStatus,
+        NetworkKind, NetworkRoute, ToggleStatus,
+    };
+    use gpui::px;
 
     fn network_status(signal_strength: Option<u8>) -> ToggleStatus {
         ToggleStatus {
             available: true,
             enabled: true,
+            connected: false,
             wired: false,
             signal_strength,
             interface: None,
@@ -1233,6 +1739,31 @@ mod tests {
             upload_kbps: None,
             label: String::new(),
         }
+    }
+
+    fn battery_status(available: bool, percent: u8, charging: bool) -> BatteryStatus {
+        BatteryStatus {
+            available,
+            percent,
+            charging,
+            state: String::new(),
+            health: String::new(),
+        }
+    }
+
+    fn assert_normalized_icon(icon: StatusIcon) {
+        const BASE_SIZE: f32 = 13.0;
+        let visible_height = f32::from(icon.text_size(px(BASE_SIZE))) * icon.visible_height
+            / STATUS_ICON_UNITS_PER_EM;
+        let reference_height =
+            BASE_SIZE * STATUS_ICON_REFERENCE_VISIBLE_HEIGHT / STATUS_ICON_UNITS_PER_EM;
+        assert!(
+            (visible_height - reference_height).abs() < 0.001,
+            "{} normalized to {} instead of {}",
+            icon.glyph,
+            visible_height,
+            reference_height,
+        );
     }
 
     #[test]
@@ -1254,9 +1785,85 @@ mod tests {
             interface: "wlan0".to_string(),
         };
 
-        assert_eq!(network_icon(&status, Some(&ethernet)), "\u{f0200}");
-        assert_eq!(network_icon(&status, Some(&wifi)), "\u{f0928}");
-        assert_eq!(network_icon(&status, None), "\u{f092c}");
+        assert_eq!(network_icon(&status, Some(&ethernet)).glyph, "\u{f0200}");
+        assert_eq!(network_icon(&status, Some(&wifi)).glyph, "\u{f0928}");
+        assert_eq!(network_icon(&status, None).glyph, "\u{f092c}");
+    }
+
+    #[test]
+    fn status_icon_states_normalize_to_the_battery_reference_height() {
+        for status in [
+            LevelStatus {
+                available: false,
+                percent: 0,
+                muted: false,
+            },
+            LevelStatus {
+                available: true,
+                percent: 50,
+                muted: true,
+            },
+            LevelStatus {
+                available: true,
+                percent: 1,
+                muted: false,
+            },
+            LevelStatus {
+                available: true,
+                percent: 34,
+                muted: false,
+            },
+            LevelStatus {
+                available: true,
+                percent: 67,
+                muted: false,
+            },
+        ] {
+            assert_normalized_icon(volume_icon(status));
+        }
+
+        let wifi = NetworkRoute {
+            kind: NetworkKind::Wifi,
+            interface: "wlan0".to_string(),
+        };
+        let ethernet = NetworkRoute {
+            kind: NetworkKind::Wired,
+            interface: "eth0".to_string(),
+        };
+        let mut unavailable = network_status(None);
+        unavailable.available = false;
+        let mut disabled = network_status(None);
+        disabled.enabled = false;
+        for icon in [
+            network_icon(&unavailable, Some(&wifi)),
+            network_icon(&network_status(None), None),
+            network_icon(&disabled, Some(&wifi)),
+            network_icon(&network_status(None), Some(&ethernet)),
+            network_icon(&network_status(Some(25)), Some(&wifi)),
+            network_icon(&network_status(Some(50)), Some(&wifi)),
+            network_icon(&network_status(Some(75)), Some(&wifi)),
+            network_icon(&network_status(Some(100)), Some(&wifi)),
+        ] {
+            assert_normalized_icon(icon);
+        }
+
+        for percent in [0, 11, 21, 31, 41, 51, 61, 71, 81, 91] {
+            assert_normalized_icon(battery_icon(&battery_status(true, percent, true)));
+            assert_normalized_icon(battery_icon(&battery_status(true, percent, false)));
+        }
+        assert_normalized_icon(battery_icon(&battery_status(false, 0, false)));
+    }
+
+    #[test]
+    fn bluetooth_icon_requires_an_active_connection() {
+        let mut status = network_status(None);
+        assert!(!bluetooth_icon_visible(&status));
+
+        status.connected = true;
+        assert!(bluetooth_icon_visible(&status));
+
+        status.enabled = false;
+        assert!(!bluetooth_icon_visible(&status));
     }
 
     #[test]

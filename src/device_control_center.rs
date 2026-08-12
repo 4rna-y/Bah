@@ -1,14 +1,26 @@
-use async_channel::Receiver;
-use gpui::{
-    Context, FocusHandle, KeyDownEvent, MouseButton, Render, Window, div, prelude::*, px, rgb, rgba,
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Command,
+    thread,
+    time::Duration,
 };
 
+use gpui::{
+    Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Render, Window, div, img, prelude::*, px, rgb, rgba,
+};
+use log::error;
+
 use crate::{
-    app::{DeviceControlCenterLock, DeviceControlCenterRoute, DeviceControlCenterRouteServer},
+    app::{DeviceControlCenterPage, DeviceControlCenterRoute},
+    config::Config,
+    hyprland::display::DisplayLayout,
+    modules::airpods::AirPodsListeningMode,
     modules::system_controls::{
-        ActiveNetwork, ControlAction, ControlChannels, ControlSnapshot, IpSettings,
+        ActiveNetwork, BluetoothDevice, BluetoothEvent, BluetoothPairingPrompt,
+        BluetoothPairingResponse, ControlAction, ControlChannels, ControlSnapshot, IpSettings,
         NetworkSettings, NetworkSettingsEvent, WifiConnectionEvent, WifiNetwork, WifiSecurity,
-        start_worker,
     },
     theme::ui_font,
 };
@@ -16,6 +28,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum InputField {
     Password,
+    BluetoothPin,
     Ipv4Address,
     Ipv4Subnet,
     Ipv4Gateway,
@@ -32,16 +45,17 @@ impl InputField {
     fn element_id(self) -> u32 {
         match self {
             Self::Password => 0,
-            Self::Ipv4Address => 1,
-            Self::Ipv4Subnet => 2,
-            Self::Ipv4Gateway => 3,
-            Self::Ipv4PrimaryDns => 4,
-            Self::Ipv4SecondaryDns => 5,
-            Self::Ipv6Address => 6,
-            Self::Ipv6Prefix => 7,
-            Self::Ipv6Gateway => 8,
-            Self::Ipv6PrimaryDns => 9,
-            Self::Ipv6SecondaryDns => 10,
+            Self::BluetoothPin => 1,
+            Self::Ipv4Address => 2,
+            Self::Ipv4Subnet => 3,
+            Self::Ipv4Gateway => 4,
+            Self::Ipv4PrimaryDns => 5,
+            Self::Ipv4SecondaryDns => 6,
+            Self::Ipv6Address => 7,
+            Self::Ipv6Prefix => 8,
+            Self::Ipv6Gateway => 9,
+            Self::Ipv6PrimaryDns => 10,
+            Self::Ipv6SecondaryDns => 11,
         }
     }
 }
@@ -53,6 +67,62 @@ fn default_route_badge(network: &ActiveNetwork) -> Option<&'static str> {
         (false, true) => Some("✓ IPv6"),
         (false, false) => None,
     }
+}
+
+fn is_wallpaper_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "webp"
+                | "gif"
+                | "mp4"
+                | "webm"
+                | "mkv"
+                | "avi"
+                | "mov"
+                | "m4v"
+        )
+    )
+}
+
+fn select_wallpaper_with_zenity() -> anyhow::Result<Option<PathBuf>> {
+    let output = Command::new("zenity")
+        // Zenity is GTK's native file chooser. Force its Wayland backend so
+        // no XWayland or portal parent surface is involved.
+        .env("GDK_BACKEND", "wayland")
+        .args([
+            "--file-selection",
+            "--title=壁紙を選択",
+            "--file-filter=画像 | *.png *.jpg *.jpeg *.webp *.gif",
+            "--file-filter=動画 | *.mp4 *.webm *.mkv *.avi *.mov *.m4v",
+        ])
+        .output()
+        .map_err(|error| anyhow::anyhow!("Waylandファイルブラウザを起動できません: {error}"))?;
+
+    if output.status.success() {
+        let path = String::from_utf8(output.stdout)
+            .map_err(|error| anyhow::anyhow!("選択されたパスを読み取れません: {error}"))?;
+        let path = PathBuf::from(path.trim());
+        return path
+            .canonicalize()
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("選択されたファイルを開けません: {error}"));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(anyhow::anyhow!(if message.is_empty() {
+        "Waylandファイルブラウザが終了しました".to_string()
+    } else {
+        format!("Waylandファイルブラウザを起動できません: {message}")
+    }))
 }
 
 #[derive(Clone)]
@@ -74,116 +144,305 @@ struct NetworkDetails {
     saving: bool,
 }
 
-/// The standalone device control center currently has one real page. Keeping
-/// the sidebar separate makes adding the remaining device pages non-breaking.
+#[derive(Clone)]
+struct BluetoothPairingDialog {
+    device_path: String,
+    device_label: String,
+    prompt: BluetoothPairingPrompt,
+    pin_code: String,
+}
+
+#[derive(Clone, Debug)]
+struct MonitorDrag {
+    name: String,
+    start_pointer_x: f32,
+    start_pointer_y: f32,
+    start_x: i32,
+    start_y: i32,
+    preview_scale: f32,
+}
+
 pub struct DeviceControlCenter {
-    _lock: DeviceControlCenterLock,
-    _route_server: DeviceControlCenterRouteServer,
     controls: ControlChannels,
     snapshot: ControlSnapshot,
+    page: DeviceControlCenterPage,
     selected_ssid: Option<Vec<u8>>,
     modal: Option<Modal>,
     details: Option<NetworkDetails>,
+    bluetooth_pairing: Option<BluetoothPairingDialog>,
+    bluetooth_operations: std::collections::HashMap<String, bool>,
+    bluetooth_message: Option<String>,
     active_input: Option<InputField>,
     activate_requested: bool,
     input_focus: FocusHandle,
+    display_layout: Option<DisplayLayout>,
+    display_original: Option<DisplayLayout>,
+    display_wallpapers: BTreeMap<String, PathBuf>,
+    display_selected: Option<String>,
+    display_drag: Option<MonitorDrag>,
+    display_message: Option<String>,
+    display_applying: bool,
 }
 
 impl DeviceControlCenter {
-    pub fn new(
-        lock: DeviceControlCenterLock,
+    pub fn new_popover(
+        controls: ControlChannels,
+        snapshot: ControlSnapshot,
         route: DeviceControlCenterRoute,
-        route_updates: Receiver<DeviceControlCenterRoute>,
-        route_server: DeviceControlCenterRouteServer,
         cx: &mut Context<Self>,
     ) -> Self {
-        let controls = start_worker();
-        let updates = controls.updates.clone();
-        let wifi_events = controls.wifi_events.clone();
-        let network_settings_events = controls.network_settings_events.clone();
+        let _ = controls.actions.try_send(ControlAction::SetWifiDiscovery(
+            route.page == DeviceControlCenterPage::Network,
+        ));
         let _ = controls
             .actions
-            .try_send(ControlAction::SetWifiDiscovery(true));
-
-        cx.spawn(async move |center, cx| {
-            while let Ok(snapshot) = updates.recv().await {
-                if center
-                    .update(cx, |center, cx| {
-                        center.snapshot = snapshot;
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        })
-        .detach();
-        cx.spawn(async move |center, cx| {
-            while let Ok(route) = route_updates.recv().await {
-                if center
-                    .update(cx, |center, cx| {
-                        center.apply_route(route);
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        })
-        .detach();
-        cx.spawn(async move |center, cx| {
-            while let Ok(event) = wifi_events.recv().await {
-                if center
-                    .update(cx, |center, cx| {
-                        center.apply_connection_event(event);
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        })
-        .detach();
-        cx.spawn(async move |center, cx| {
-            while let Ok(event) = network_settings_events.recv().await {
-                if center
-                    .update(cx, |center, cx| {
-                        center.apply_network_settings_event(event);
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        })
-        .detach();
-
+            .try_send(ControlAction::SetBluetoothDiscovery(
+                route.page == DeviceControlCenterPage::Bluetooth,
+            ));
+        let display_layout = crate::hyprland::display::load_layout().ok();
+        let display_selected = display_layout.as_ref().map(|layout| layout.main.clone());
+        let display_wallpapers = Config::load().unwrap_or_default().wallpapers;
         Self {
-            _lock: lock,
-            _route_server: route_server,
             controls,
-            snapshot: ControlSnapshot::default(),
+            snapshot,
+            page: route.page,
             selected_ssid: route.ssid,
             modal: None,
             details: None,
+            bluetooth_pairing: None,
+            bluetooth_operations: std::collections::HashMap::new(),
+            bluetooth_message: None,
             active_input: None,
             activate_requested: false,
             input_focus: cx.focus_handle(),
+            display_original: display_layout.clone(),
+            display_layout,
+            display_wallpapers,
+            display_selected,
+            display_drag: None,
+            display_message: None,
+            display_applying: false,
         }
     }
 
-    fn apply_route(&mut self, route: DeviceControlCenterRoute) {
-        self.selected_ssid = route.ssid;
-        self.modal = None;
-        self.details = None;
-        self.active_input = None;
-        self.activate_requested = true;
+    pub fn set_snapshot(&mut self, snapshot: ControlSnapshot, cx: &mut Context<Self>) {
+        self.snapshot = snapshot;
+        cx.notify();
     }
 
+    pub fn apply_wifi_update(&mut self, event: WifiConnectionEvent, cx: &mut Context<Self>) {
+        self.apply_connection_event(event);
+        cx.notify();
+    }
+
+    pub fn apply_bluetooth_update(&mut self, event: BluetoothEvent, cx: &mut Context<Self>) {
+        self.apply_bluetooth_event(event);
+        cx.notify();
+    }
+
+    pub fn apply_network_settings_update(
+        &mut self,
+        event: NetworkSettingsEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_network_settings_event(event);
+        cx.notify();
+    }
+
+    fn set_page(&mut self, page: DeviceControlCenterPage) {
+        if self.page == page {
+            return;
+        }
+        self.page = page;
+        self.modal = None;
+        self.details = None;
+        self.bluetooth_pairing = None;
+        self.active_input = None;
+        let _ = self
+            .controls
+            .actions
+            .try_send(ControlAction::SetWifiDiscovery(
+                page == DeviceControlCenterPage::Network,
+            ));
+        let _ = self
+            .controls
+            .actions
+            .try_send(ControlAction::SetBluetoothDiscovery(
+                page == DeviceControlCenterPage::Bluetooth,
+            ));
+        if page == DeviceControlCenterPage::Display {
+            self.refresh_display_state();
+        }
+    }
+
+    fn refresh_display_state(&mut self) {
+        match crate::hyprland::display::load_layout() {
+            Ok(layout) => {
+                self.display_selected = Some(layout.main.clone());
+                self.display_original = Some(layout.clone());
+                self.display_layout = Some(layout);
+                self.display_wallpapers = Config::load().unwrap_or_default().wallpapers;
+                self.display_message = None;
+            }
+            Err(error) => {
+                self.display_layout = None;
+                self.display_message = Some(format!("モニター情報を取得できません: {error}"));
+            }
+        }
+    }
+
+    fn begin_monitor_drag(
+        &mut self,
+        name: String,
+        preview_scale: f32,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(monitor) = self
+            .display_layout
+            .as_ref()
+            .and_then(|layout| layout.monitor(&name))
+        else {
+            return;
+        };
+        self.display_selected = Some(name.clone());
+        self.display_drag = Some(MonitorDrag {
+            name,
+            start_pointer_x: event.position.x.into(),
+            start_pointer_y: event.position.y.into(),
+            start_x: monitor.x,
+            start_y: monitor.y,
+            preview_scale,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn move_monitor_drag(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.display_drag.clone() else {
+            return;
+        };
+        let x = drag.start_x
+            + ((f32::from(event.position.x) - drag.start_pointer_x) / drag.preview_scale).round()
+                as i32;
+        let y = drag.start_y
+            + ((f32::from(event.position.y) - drag.start_pointer_y) / drag.preview_scale).round()
+                as i32;
+        if let Some(layout) = self.display_layout.as_mut() {
+            layout.move_monitor(&drag.name, x, y);
+            cx.notify();
+        }
+    }
+
+    fn end_monitor_drag(&mut self, cx: &mut Context<Self>) {
+        if self.display_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn set_main_monitor(&mut self, name: String, cx: &mut Context<Self>) {
+        if let Some(layout) = self.display_layout.as_mut()
+            && layout.normalize_main(&name)
+        {
+            self.display_selected = Some(name);
+            cx.notify();
+        }
+    }
+
+    fn choose_wallpaper(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(output) = self.display_selected.clone() else {
+            return;
+        };
+        let wallpapers = self.display_wallpapers.clone();
+        let result = thread::Builder::new()
+            .name("bah-wallpaper-picker".to_string())
+            .spawn(move || {
+                // The DCC is an input-grabbing popup. Unmap it before the
+                // native chooser asks Wayland for focus.
+                thread::sleep(Duration::from_millis(50));
+                match select_wallpaper_with_zenity() {
+                    Ok(Some(path)) if path.is_file() && is_wallpaper_file(&path) => {
+                        match Config::load() {
+                            Ok(mut config) => {
+                                let mut wallpapers = wallpapers;
+                                wallpapers.insert(output, path);
+                                config.wallpapers = wallpapers;
+                                if let Err(error) = config.save() {
+                                    error!("could not save selected wallpaper: {error}");
+                                }
+                            }
+                            Err(error) => {
+                                error!("could not load configuration for wallpaper: {error}")
+                            }
+                        }
+                    }
+                    Ok(Some(path)) => error!(
+                        "selected file is not a supported wallpaper: {}",
+                        path.display()
+                    ),
+                    Ok(None) => {}
+                    Err(error) => error!("Wayland file browser failed: {error}"),
+                }
+                crate::app::request_device_control_center(DeviceControlCenterRoute {
+                    page: DeviceControlCenterPage::Display,
+                    ssid: None,
+                });
+            });
+        if let Err(error) = result {
+            self.display_message = Some(format!("壁紙選択を開始できませんでした: {error}"));
+            cx.notify();
+            return;
+        }
+        window.remove_window();
+    }
+
+    fn clear_wallpaper(&mut self, cx: &mut Context<Self>) {
+        if let Some(name) = &self.display_selected {
+            self.display_wallpapers.remove(name);
+            cx.notify();
+        }
+    }
+
+    fn apply_display_changes(&mut self, cx: &mut Context<Self>) {
+        if self.display_applying {
+            return;
+        }
+        let Some(layout) = self.display_layout.clone() else {
+            return;
+        };
+        if layout.overlaps() {
+            self.display_message =
+                Some("モニターが重なっています。重ならないように配置してください。".into());
+            cx.notify();
+            return;
+        }
+        self.display_applying = true;
+        self.display_message = None;
+        let original_config = Config::load().unwrap_or_default();
+        let mut updated_config = original_config.clone();
+        updated_config.wallpapers = self.display_wallpapers.clone();
+        let result = updated_config
+            .save()
+            .and_then(|()| crate::hyprland::display::apply_layout(&layout));
+        match result {
+            Ok(()) => {
+                if let Err(error) = crate::app::restart_wallpaper_process() {
+                    self.display_message = Some(format!(
+                        "配置は保存しましたが、壁紙を更新できません: {error}"
+                    ));
+                } else {
+                    self.display_message = Some("ディスプレイ設定を適用しました。".into());
+                }
+                self.display_original = Some(layout);
+            }
+            Err(error) => {
+                let _ = original_config.save();
+                self.display_message = Some(format!("適用できませんでした: {error}"));
+            }
+        }
+        self.display_applying = false;
+        cx.notify();
+    }
     fn select_network(&mut self, network: WifiNetwork, cx: &mut Context<Self>) {
         self.selected_ssid = Some(network.ssid.clone());
         self.details = None;
@@ -226,16 +485,14 @@ impl DeviceControlCenter {
                 password,
             })
             .is_err()
-        {
-            if let Some(Modal::Password {
+            && let Some(Modal::Password {
                 message,
                 connecting,
                 ..
             }) = self.modal.as_mut()
-            {
-                *connecting = false;
-                *message = Some("接続要求を送信できませんでした".to_string());
-            }
+        {
+            *connecting = false;
+            *message = Some("接続要求を送信できませんでした".to_string());
         }
     }
 
@@ -329,6 +586,147 @@ impl DeviceControlCenter {
         }
     }
 
+    fn toggle_bluetooth(&mut self, cx: &mut Context<Self>) {
+        if self.snapshot.bluetooth.available {
+            let _ = self
+                .controls
+                .actions
+                .try_send(ControlAction::ToggleBluetooth);
+            cx.notify();
+        }
+    }
+
+    fn set_airpods_mode(&mut self, mode: AirPodsListeningMode, cx: &mut Context<Self>) {
+        if self.snapshot.airpods.ready {
+            self.snapshot.airpods.listening_mode = Some(mode);
+            self.snapshot.airpods.message = None;
+            if self
+                .controls
+                .actions
+                .try_send(ControlAction::SetAirPodsListeningMode(mode))
+                .is_err()
+            {
+                self.snapshot.airpods.message =
+                    Some("AirPodsへの操作要求を送信できませんでした".to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn select_bluetooth_device(&mut self, device: BluetoothDevice, cx: &mut Context<Self>) {
+        if self.bluetooth_operations.contains_key(&device.path) {
+            return;
+        }
+        let action = if device.connected {
+            ControlAction::DisconnectBluetooth {
+                device_path: device.path,
+            }
+        } else if device.paired {
+            ControlAction::ConnectBluetooth {
+                device_path: device.path,
+            }
+        } else {
+            ControlAction::PairBluetooth {
+                device_path: device.path,
+            }
+        };
+        if self.controls.actions.try_send(action).is_err() {
+            self.bluetooth_message = Some("Bluetoothの操作要求を送信できませんでした".to_string());
+        }
+        cx.notify();
+    }
+
+    fn apply_bluetooth_event(&mut self, event: BluetoothEvent) {
+        match event {
+            BluetoothEvent::OperationStarted {
+                device_path,
+                pairing,
+            } => {
+                self.bluetooth_operations.insert(device_path, pairing);
+                self.bluetooth_message = None;
+            }
+            BluetoothEvent::PairingPrompt {
+                device_path,
+                prompt,
+            } => {
+                let device_label = self
+                    .snapshot
+                    .bluetooth_devices
+                    .iter()
+                    .find(|device| device.path == device_path)
+                    .map(|device| device.label.clone())
+                    .unwrap_or_else(|| "Bluetoothデバイス".to_string());
+                self.bluetooth_pairing = Some(BluetoothPairingDialog {
+                    device_path,
+                    device_label,
+                    prompt,
+                    pin_code: String::new(),
+                });
+                self.active_input = None;
+            }
+            BluetoothEvent::Succeeded { device_path } => {
+                self.bluetooth_operations.remove(&device_path);
+                self.bluetooth_pairing = None;
+                self.active_input = None;
+            }
+            BluetoothEvent::Failed {
+                device_path,
+                message,
+            } => {
+                self.bluetooth_operations.remove(&device_path);
+                self.bluetooth_pairing = None;
+                self.active_input = None;
+                self.bluetooth_message = Some(message);
+            }
+        }
+    }
+
+    fn respond_bluetooth_pairing(&mut self, accepted: bool, cx: &mut Context<Self>) {
+        let Some(dialog) = self.bluetooth_pairing.take() else {
+            return;
+        };
+        let response = match dialog.prompt {
+            BluetoothPairingPrompt::PinCode | BluetoothPairingPrompt::Passkey if accepted => {
+                if dialog.pin_code.trim().is_empty() {
+                    self.bluetooth_pairing = Some(dialog);
+                    self.bluetooth_message =
+                        Some("PINまたはパスキーを入力してください".to_string());
+                    cx.notify();
+                    return;
+                }
+                BluetoothPairingResponse::PinCode {
+                    device_path: dialog.device_path,
+                    pin_code: dialog.pin_code,
+                }
+            }
+            BluetoothPairingPrompt::DisplayPinCode { .. }
+            | BluetoothPairingPrompt::DisplayPasskey { .. }
+                if accepted =>
+            {
+                self.active_input = None;
+                cx.notify();
+                return;
+            }
+            _ if accepted => BluetoothPairingResponse::Confirm {
+                device_path: dialog.device_path,
+                accepted: true,
+            },
+            _ => BluetoothPairingResponse::Cancel {
+                device_path: dialog.device_path,
+            },
+        };
+        if self
+            .controls
+            .bluetooth_pairing_responses
+            .try_send(response)
+            .is_err()
+        {
+            self.bluetooth_message = Some("ペアリング応答を送信できませんでした".to_string());
+        }
+        self.active_input = None;
+        cx.notify();
+    }
+
     fn open_details(&mut self, network: ActiveNetwork, cx: &mut Context<Self>) {
         self.details = Some(NetworkDetails {
             settings: network.settings.clone(),
@@ -364,11 +762,17 @@ impl DeviceControlCenter {
         if event.keystroke.key == "escape" {
             if self.modal.is_some() {
                 self.close_modal(cx);
+            } else if self.bluetooth_pairing.is_some() {
+                self.respond_bluetooth_pairing(false, cx);
             }
             return;
         }
         if event.keystroke.key == "enter" && self.active_input == Some(InputField::Password) {
             self.connect_password_network(cx);
+            return;
+        }
+        if event.keystroke.key == "enter" && self.active_input == Some(InputField::BluetoothPin) {
+            self.respond_bluetooth_pairing(true, cx);
             return;
         }
         let Some(field) = self.active_input else {
@@ -397,6 +801,12 @@ impl DeviceControlCenter {
                 Some(Modal::Password { password, .. }) => Some(password),
                 _ => None,
             };
+        }
+        if field == InputField::BluetoothPin {
+            return self
+                .bluetooth_pairing
+                .as_mut()
+                .map(|dialog| &mut dialog.pin_code);
         }
         let details = self.details.as_mut()?;
         let (settings, is_ipv6) = match field {
@@ -490,6 +900,13 @@ impl DeviceControlCenter {
                 Some(Modal::Password { password, .. }) => "•".repeat(password.chars().count()),
                 _ => String::new(),
             };
+        }
+        if field == InputField::BluetoothPin {
+            return self
+                .bluetooth_pairing
+                .as_ref()
+                .map(|dialog| dialog.pin_code.clone())
+                .unwrap_or_default();
         }
         let Some(details) = self.details.as_ref() else {
             return String::new();
@@ -679,6 +1096,7 @@ impl Render for DeviceControlCenter {
         }
         let muted = rgb(0xaeb1bd);
         let panel = rgb(0x202128);
+        let page = self.page;
         let wifi_enabled = self.snapshot.wifi.enabled;
         let networks = self.snapshot.wifi_networks.clone();
         let active_networks = self.snapshot.active_networks.clone();
@@ -716,15 +1134,69 @@ impl Render for DeviceControlCenter {
                             .flex_col()
                             .border_r_1()
                             .border_color(rgb(0x343640))
+                            .gap(px(6.0))
                             .child(
                                 div()
+                                    .id("dcc-page-network")
                                     .h(px(36.0))
                                     .px(px(10.0))
                                     .rounded(px(6.0))
                                     .flex()
                                     .items_center()
-                                    .bg(rgb(0x343640))
+                                    .cursor_pointer()
+                                    .bg(if page == DeviceControlCenterPage::Network {
+                                        rgb(0x343640)
+                                    } else {
+                                        rgb(0x202128)
+                                    })
+                                    .hover(|style| style.bg(rgb(0x343640)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_page(DeviceControlCenterPage::Network);
+                                        cx.notify();
+                                    }))
                                     .child("ネットワーク"),
+                            )
+                            .child(
+                                div()
+                                    .id("dcc-page-bluetooth")
+                                    .h(px(36.0))
+                                    .px(px(10.0))
+                                    .rounded(px(6.0))
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .bg(if page == DeviceControlCenterPage::Bluetooth {
+                                        rgb(0x343640)
+                                    } else {
+                                        rgb(0x202128)
+                                    })
+                                    .hover(|style| style.bg(rgb(0x343640)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_page(DeviceControlCenterPage::Bluetooth);
+                                        cx.notify();
+                                    }))
+                                    .child("Bluetooth"),
+                            )
+                            .child(
+                                div()
+                                    .id("dcc-page-display")
+                                    .h(px(36.0))
+                                    .px(px(10.0))
+                                    .rounded(px(6.0))
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .bg(if page == DeviceControlCenterPage::Display {
+                                        rgb(0x343640)
+                                    } else {
+                                        rgb(0x202128)
+                                    })
+                                    .hover(|style| style.bg(rgb(0x343640)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_page(DeviceControlCenterPage::Display);
+                                        cx.notify();
+                                    }))
+                                    .child("ディスプレイ"),
                             ),
                     )
                     .child(
@@ -905,16 +1377,849 @@ impl Render for DeviceControlCenter {
                     ),
             )
             )
+            .when(page == DeviceControlCenterPage::Bluetooth, |root| {
+                root.child(
+                    div()
+                        .id("dcc-bluetooth-page")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left(px(210.0))
+                        .child(self.render_bluetooth_page(cx)),
+                )
+            })
+            .when(page == DeviceControlCenterPage::Display, |root| {
+                root.child(
+                    div()
+                        .id("dcc-display-page")
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left(px(210.0))
+                        .child(self.render_display_page(cx)),
+                )
+            })
             .when_some(details, |root, details| {
                 root.child(self.render_network_details_modal(details, cx))
             })
             .when_some(modal, |root, modal| {
                 root.child(self.render_modal(modal, window, cx))
             })
+            .when_some(self.bluetooth_pairing.clone(), |root, dialog| {
+                root.child(self.render_bluetooth_pairing_modal(dialog, window, cx))
+            })
+            .into_any_element()
     }
 }
 
 impl DeviceControlCenter {
+    fn render_display_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = rgb(0x202128);
+        let muted = rgb(0xaeb1bd);
+        let selected_name = self.display_selected.clone();
+        let Some(layout) = self.display_layout.clone() else {
+            return div()
+                .size_full()
+                .p(px(28.0))
+                .bg(rgb(0x17181e))
+                .text_color(rgb(0xf5f5f7))
+                .font(ui_font())
+                .child(div().text_size(px(24.0)).child("ディスプレイ"))
+                .child(div().mt(px(16.0)).text_color(rgb(0xffa6a6)).child(
+                    self.display_message.clone().unwrap_or_else(|| {
+                        "モニター情報を取得できません。Hyprland上で実行してください。".into()
+                    }),
+                ));
+        };
+
+        let min_x = layout
+            .monitors
+            .iter()
+            .map(|monitor| monitor.x)
+            .min()
+            .unwrap_or(0);
+        let min_y = layout
+            .monitors
+            .iter()
+            .map(|monitor| monitor.y)
+            .min()
+            .unwrap_or(0);
+        let max_x = layout
+            .monitors
+            .iter()
+            .map(|monitor| monitor.x + monitor.logical_size().0)
+            .max()
+            .unwrap_or(1);
+        let max_y = layout
+            .monitors
+            .iter()
+            .map(|monitor| monitor.y + monitor.logical_size().1)
+            .max()
+            .unwrap_or(1);
+        let preview_scale = (520.0 / (max_x - min_x).max(1) as f32)
+            .min(250.0 / (max_y - min_y).max(1) as f32)
+            .min(0.22)
+            .max(0.035);
+        let monitors = layout.monitors.clone();
+        let canvas = div()
+            .id("dcc-display-layout")
+            .relative()
+            .h(px(282.0))
+            .w_full()
+            .rounded(px(8.0))
+            .bg(rgb(0x15161b))
+            .border_1()
+            .border_color(rgb(0x343640))
+            .overflow_hidden()
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.move_monitor_drag(event, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_monitor_drag(cx)),
+            )
+            .children(monitors.iter().enumerate().map(|(index, monitor)| {
+                let (width, height) = monitor.logical_size();
+                let left = 16.0 + (monitor.x - min_x) as f32 * preview_scale;
+                let top = 16.0 + (monitor.y - min_y) as f32 * preview_scale;
+                let panel_width = (width as f32 * preview_scale).max(52.0);
+                let panel_height = (height as f32 * preview_scale).max(38.0);
+                let name = monitor.name.clone();
+                let selected = selected_name.as_deref() == Some(name.as_str());
+                let main = layout.main == name;
+                div()
+                    .id(("dcc-display-monitor", index as u32))
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(panel_width))
+                    .h(px(panel_height))
+                    .p(px(6.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .bg(if selected {
+                        rgb(0x526577)
+                    } else {
+                        rgb(0x343640)
+                    })
+                    .border_1()
+                    .border_color(if main { rgb(0x63d297) } else { rgb(0x777b8c) })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event, _, cx| {
+                            this.begin_monitor_drag(name.clone(), preview_scale, event, cx);
+                        }),
+                    )
+                    .child(div().text_size(px(12.0)).text_center().child(if main {
+                        format!("{} ★", monitor.name)
+                    } else {
+                        monitor.name.clone()
+                    }))
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .text_size(px(10.0))
+                            .text_color(muted)
+                            .text_center()
+                            .child(format!("{} × {}", monitor.x, monitor.y)),
+                    )
+            }));
+
+        let selected_monitor = selected_name
+            .as_deref()
+            .and_then(|name| layout.monitor(name))
+            .cloned();
+        let selected_is_main = selected_monitor
+            .as_ref()
+            .is_some_and(|monitor| monitor.name == layout.main);
+        let wallpaper_label = selected_name.as_ref().and_then(|name| {
+            self.display_wallpapers.get(name).map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            })
+        });
+        let overlap_message = layout
+            .overlaps()
+            .then_some("モニターが重なっています。適用前に分離してください。");
+
+        div()
+            .size_full()
+            .p(px(28.0))
+            .bg(rgb(0x17181e))
+            .text_color(rgb(0xf5f5f7))
+            .font(ui_font())
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_size(px(24.0)).child("ディスプレイ"))
+                    .child(
+                        div()
+                            .id("dcc-display-refresh")
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .bg(panel)
+                            .hover(|style| style.bg(rgb(0x343640)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.refresh_display_state();
+                                cx.notify();
+                            }))
+                            .child("再読み込み"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(muted)
+                    .child("モニターをドラッグして配置を変更します。近い辺には自動で吸着します。"),
+            )
+            .child(canvas)
+            .when_some(selected_monitor, |page, monitor| {
+                let monitor_name = monitor.name.clone();
+                page.child(
+                    div()
+                        .p(px(14.0))
+                        .rounded(px(8.0))
+                        .bg(panel)
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .child(div().child(format!(
+                                    "{}  {}×{}",
+                                    monitor.name, monitor.width, monitor.height
+                                )))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(muted)
+                                        .child(format!("位置: {} × {}", monitor.x, monitor.y)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("dcc-display-main")
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_main_monitor(monitor_name.clone(), cx);
+                                }))
+                                .child(
+                                    div()
+                                        .size(px(16.0))
+                                        .rounded(px(3.0))
+                                        .border_1()
+                                        .border_color(if selected_is_main {
+                                            rgb(0x63d297)
+                                        } else {
+                                            rgb(0x777b8c)
+                                        })
+                                        .bg(if selected_is_main {
+                                            rgb(0x315b46)
+                                        } else {
+                                            rgb(0x17181e)
+                                        })
+                                        .text_center()
+                                        .text_size(px(12.0))
+                                        .child(if selected_is_main { "✓" } else { "" }),
+                                )
+                                .child("メインモニターにする"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(div().text_color(muted).child("壁紙:"))
+                                .child(
+                                    div().flex_1().min_w(px(0.0)).text_size(px(12.0)).child(
+                                        wallpaper_label.unwrap_or_else(|| {
+                                            "個別設定なし（共通壁紙を使用）".into()
+                                        }),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .id("dcc-display-wallpaper-choose")
+                                        .px(px(9.0))
+                                        .py(px(5.0))
+                                        .rounded(px(4.0))
+                                        .cursor_pointer()
+                                        .bg(rgb(0x343640))
+                                        .hover(|style| style.bg(rgb(0x526577)))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.choose_wallpaper(window, cx);
+                                        }))
+                                        .child("選択"),
+                                )
+                                .child(
+                                    div()
+                                        .id("dcc-display-wallpaper-clear")
+                                        .px(px(9.0))
+                                        .py(px(5.0))
+                                        .rounded(px(4.0))
+                                        .cursor_pointer()
+                                        .bg(rgb(0x343640))
+                                        .hover(|style| style.bg(rgb(0x526577)))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.clear_wallpaper(cx)),
+                                        )
+                                        .child("解除"),
+                                ),
+                        ),
+                )
+            })
+            .when_some(overlap_message, |page, message| {
+                page.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xffa6a6))
+                        .child(message),
+                )
+            })
+            .when_some(self.display_message.clone(), |page, message| {
+                page.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xaeb1bd))
+                        .child(message),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                div().flex().justify_end().child(
+                    div()
+                        .id("dcc-display-apply")
+                        .px(px(16.0))
+                        .py(px(8.0))
+                        .rounded(px(5.0))
+                        .cursor_pointer()
+                        .opacity(if layout.overlaps() || self.display_applying {
+                            0.45
+                        } else {
+                            1.0
+                        })
+                        .bg(rgb(0x315b46))
+                        .hover(|style| style.bg(rgb(0x3b7357)))
+                        .on_click(cx.listener(|this, _, _, cx| this.apply_display_changes(cx)))
+                        .child(if self.display_applying {
+                            "適用中…"
+                        } else {
+                            "適用"
+                        }),
+                ),
+            )
+    }
+
+    fn render_airpods_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = rgb(0x2a2c35);
+        let muted = rgb(0xaeb1bd);
+        let selected = self.snapshot.airpods.listening_mode;
+        let ready = self.snapshot.airpods.ready;
+        let pod = |label: &'static str, path: &'static str, percent: Option<u8>| {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    img(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path))
+                        .size(px(54.0)),
+                )
+                .child(div().text_size(px(12.0)).text_color(muted).child(format!(
+                        "{label}  {}",
+                        percent
+                            .map(|value| format!("{value}%"))
+                            .unwrap_or_else(|| "—%".to_string())
+                    )))
+                .child(
+                    div()
+                        .w_full()
+                        .my(px(4.0))
+                        .h(px(5.0))
+                        .rounded_full()
+                        .bg(rgb(0x454853))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(percent.unwrap_or(0).min(100) as f32 / 100.0))
+                                .rounded_full()
+                                .bg(rgb(0x63d297)),
+                        ),
+                )
+        };
+        let mode_button = |id: &'static str,
+                           label: &'static str,
+                           icon: &'static str,
+                           candidate: AirPodsListeningMode| {
+            let is_selected = selected == Some(candidate);
+            div()
+                .flex_1()
+                .h_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .id(format!("dcc-airpods-mode-{id}"))
+                        .w_full()
+                        .h(px(34.0))
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(rgb(0x454853))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(22.0))
+                        .text_color(if is_selected { rgb(0xf5f5f7) } else { muted })
+                        .bg(if is_selected {
+                            rgb(0x343640)
+                        } else {
+                            rgb(0x202128)
+                        })
+                        .opacity(if ready { 1.0 } else { 0.45 })
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x343640)))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.set_airpods_mode(candidate, cx)),
+                        )
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .h(px(16.0))
+                        .text_size(px(8.0))
+                        .text_color(if is_selected { rgb(0xf5f5f7) } else { muted })
+                        .child(label),
+                )
+        };
+
+        div()
+            .p(px(12.0))
+            .rounded(px(7.0))
+            .bg(panel)
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(div().text_size(px(14.0)).child("AirPods"))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(18.0))
+                    .child(pod(
+                        "L",
+                        "src/icon/airpods_l_icon.svg",
+                        self.snapshot.airpods.left_percent,
+                    ))
+                    .child(pod(
+                        "R",
+                        "src/icon/airpods_r_icon.svg",
+                        self.snapshot.airpods.right_percent,
+                    )),
+            )
+            .child(
+                div()
+                    .h(px(54.0))
+                    .flex()
+                    .gap(px(5.0))
+                    .child(mode_button(
+                        "transparency",
+                        "外音取り込み",
+                        "\u{f07c5}",
+                        AirPodsListeningMode::Transparency,
+                    ))
+                    .child(mode_button(
+                        "adaptive",
+                        "アダプティブ",
+                        "\u{f2a2}",
+                        AirPodsListeningMode::Adaptive,
+                    ))
+                    .child(mode_button(
+                        "noise-cancellation",
+                        "ノイズキャンセリング",
+                        "\u{f0a45}",
+                        AirPodsListeningMode::NoiseCancellation,
+                    )),
+            )
+            .when_some(self.snapshot.airpods.message.clone(), |card, message| {
+                card.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0xffa6a6))
+                        .child(message),
+                )
+            })
+            .when(!ready && self.snapshot.airpods.message.is_none(), |card| {
+                card.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(muted)
+                        .child("AirPodsを準備中…"),
+                )
+            })
+    }
+
+    fn render_bluetooth_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = rgb(0x202128);
+        let muted = rgb(0xaeb1bd);
+        let enabled = self.snapshot.bluetooth.enabled;
+        let available = self.snapshot.bluetooth.available;
+        let devices = self.snapshot.bluetooth_devices.clone();
+        let operations = self.bluetooth_operations.clone();
+        let known_devices = devices
+            .iter()
+            .filter(|device| device.connected || device.paired)
+            .cloned()
+            .collect::<Vec<_>>();
+        let other_devices = devices
+            .iter()
+            .filter(|device| !device.connected && !device.paired)
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_connected_devices = known_devices.iter().any(|device| device.connected);
+        let airpods_connected = self.snapshot.airpods.connected;
+        let airpods_card =
+            airpods_connected.then(|| self.render_airpods_card(cx).into_any_element());
+        // With no active connection, reserve only enough space for the header,
+        // status text, and up to three remembered devices; the lower scan panel
+        // gets the remaining vertical space.
+        let compact_known_panel_height =
+            (96.0 + known_devices.len().min(3) as f32 * 52.0).min(252.0);
+
+        let device_row = |id: (&'static str, u32), device: BluetoothDevice| {
+            let operation = operations.get(&device.path).copied();
+            let status = if operation.is_some() {
+                if operation == Some(true) {
+                    "ペアリング中…".to_string()
+                } else {
+                    "処理中…".to_string()
+                }
+            } else if device.connected {
+                "接続済み（クリックで切断）".to_string()
+            } else if device.paired {
+                "ペアリング済み（クリックで接続）".to_string()
+            } else {
+                "クリックでペアリング・接続".to_string()
+            };
+            let signal = device
+                .rssi
+                .map(|rssi| format!(" {rssi} dBm"))
+                .unwrap_or_default();
+            let label = device.label.clone();
+            let click_device = device.clone();
+            div()
+                .id(id)
+                .min_h(px(52.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(5.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .cursor_pointer()
+                .opacity(if operation.is_some() { 0.55 } else { 1.0 })
+                .bg(if device.connected {
+                    rgb(0x343640)
+                } else {
+                    panel
+                })
+                .hover(|style| style.bg(rgb(0x343640)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_bluetooth_device(click_device.clone(), cx)
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .child(label)
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(muted)
+                                .child(format!("{}{}", status, signal)),
+                        ),
+                )
+        };
+
+        div()
+            .size_full()
+            .p(px(28.0))
+            .bg(rgb(0x17181e))
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_size(px(24.0)).child("Bluetooth"))
+                    .child(
+                        div()
+                            .id("dcc-bluetooth-toggle")
+                            .h(px(28.0))
+                            .w(px(58.0))
+                            .p(px(3.0))
+                            .rounded(px(14.0))
+                            .cursor_pointer()
+                            .opacity(if available { 1.0 } else { 0.45 })
+                            .bg(if enabled {
+                                rgb(0x315b46)
+                            } else {
+                                rgb(0x444752)
+                            })
+                            .hover(|style| style.bg(rgb(0x526577)))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_bluetooth(cx)))
+                            .child(
+                                div()
+                                    .size(px(22.0))
+                                    .rounded_full()
+                                    .bg(rgb(0xf5f5f7))
+                                    .when(enabled, |knob| knob.ml_auto()),
+                            ),
+                    ),
+            )
+            .when_some(self.bluetooth_message.clone(), |page, message| {
+                page.child(div().text_color(rgb(0xffa6a6)).child(message))
+            })
+            .when(!available, |page| {
+                page.child(div().text_color(muted).child("Bluetoothは利用できません"))
+            })
+            .when(available && !enabled, |page| {
+                page.child(div().text_color(muted).child("Bluetoothはオフです"))
+            })
+            .when(available && enabled, |page| {
+                page.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .gap(px(18.0))
+                        .when_some(airpods_card, |content, card| {
+                            content.child(div().flex_none().child(card))
+                        })
+                        .child(
+                            div()
+                                .when(has_connected_devices, |panel| panel.flex_1())
+                                .when(!has_connected_devices, |panel| {
+                                    panel.h(px(compact_known_panel_height)).flex_none()
+                                })
+                                .min_h(px(0.0))
+                                .p(px(12.0))
+                                .rounded(px(7.0))
+                                .bg(panel)
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_color(muted)
+                                        .child("接続済み・ペアリング済みのデバイス"),
+                                )
+                                .when(known_devices.is_empty(), |list| {
+                                    list.child(div().text_color(muted).child("なし"))
+                                })
+                                .child(
+                                    div()
+                                        .id("dcc-known-bluetooth-list")
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .overflow_y_scroll()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(3.0))
+                                        .children(known_devices.into_iter().enumerate().map(
+                                            |(index, device)| {
+                                                device_row(
+                                                    ("dcc-known-bluetooth", index as u32),
+                                                    device,
+                                                )
+                                            },
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .p(px(12.0))
+                                .rounded(px(7.0))
+                                .bg(panel)
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.0))
+                                .child(div().text_color(muted).child("ほかのデバイス"))
+                                .when(other_devices.is_empty(), |list| {
+                                    list.child(
+                                        div().text_color(muted).child("周辺のデバイスを検索中…"),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id("dcc-other-bluetooth-list")
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .overflow_y_scroll()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(3.0))
+                                        .children(other_devices.into_iter().enumerate().map(
+                                            |(index, device)| {
+                                                device_row(
+                                                    ("dcc-other-bluetooth", index as u32),
+                                                    device,
+                                                )
+                                            },
+                                        )),
+                                ),
+                        ),
+                )
+            })
+    }
+
+    fn render_bluetooth_pairing_modal(
+        &self,
+        dialog: BluetoothPairingDialog,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let requires_input = matches!(
+            &dialog.prompt,
+            BluetoothPairingPrompt::PinCode | BluetoothPairingPrompt::Passkey
+        );
+        let (instruction, confirm_label) = match &dialog.prompt {
+            BluetoothPairingPrompt::PinCode => {
+                ("このデバイスのPINを入力してください".to_string(), "送信")
+            }
+            BluetoothPairingPrompt::Passkey => {
+                ("数字のパスキーを入力してください".to_string(), "送信")
+            }
+            BluetoothPairingPrompt::Confirmation { passkey } => (
+                format!("次のコードがデバイス側と一致することを確認してください: {passkey:06}"),
+                "承認",
+            ),
+            BluetoothPairingPrompt::DisplayPinCode { pin_code } => (
+                format!("デバイス側で次のPINを入力してください: {pin_code}"),
+                "閉じる",
+            ),
+            BluetoothPairingPrompt::DisplayPasskey { passkey } => (
+                format!("デバイス側に次のコードが表示されます: {passkey:06}"),
+                "閉じる",
+            ),
+            BluetoothPairingPrompt::Authorization => (
+                "このデバイスとのペアリングを許可しますか？".to_string(),
+                "許可",
+            ),
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .bg(rgba(0x00000099))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(24.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+            )
+            .child(
+                div()
+                    .id("dcc-bluetooth-pairing-modal")
+                    .w(px(440.0))
+                    .p(px(20.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(0x282a33))
+                    .track_focus(&self.input_focus)
+                    .on_key_down(
+                        cx.listener(|this, event, window, cx| {
+                            this.input_key_down(event, window, cx)
+                        }),
+                    )
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(div().text_size(px(20.0)).child("Bluetooth ペアリング"))
+                    .child(div().text_color(rgb(0xaeb1bd)).child(dialog.device_label))
+                    .child(instruction)
+                    .when(requires_input, |modal| {
+                        modal.child(
+                            div()
+                                .id("dcc-bluetooth-pairing-input")
+                                .h(px(36.0))
+                                .px(px(10.0))
+                                .rounded(px(5.0))
+                                .bg(rgb(0x17181e))
+                                .cursor_text()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.focus_input(InputField::BluetoothPin, window, cx)
+                                }))
+                                .child(self.input_value(InputField::BluetoothPin)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .when(
+                                !matches!(
+                                    &dialog.prompt,
+                                    BluetoothPairingPrompt::DisplayPinCode { .. }
+                                        | BluetoothPairingPrompt::DisplayPasskey { .. }
+                                ),
+                                |buttons| {
+                                    buttons.child(
+                                        div()
+                                            .id("dcc-bluetooth-pairing-cancel")
+                                            .h(px(34.0))
+                                            .px(px(12.0))
+                                            .rounded(px(5.0))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(0x3b3e48)))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.respond_bluetooth_pairing(false, cx)
+                                            }))
+                                            .child("キャンセル"),
+                                    )
+                                },
+                            )
+                            .child(
+                                div()
+                                    .id("dcc-bluetooth-pairing-confirm")
+                                    .h(px(34.0))
+                                    .px(px(12.0))
+                                    .rounded(px(5.0))
+                                    .cursor_pointer()
+                                    .bg(rgb(0x315b46))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.respond_bluetooth_pairing(true, cx)
+                                    }))
+                                    .child(confirm_label),
+                            ),
+                    ),
+            )
+    }
+
     fn render_network_details_modal(
         &self,
         details: NetworkDetails,
@@ -1238,7 +2543,7 @@ fn format_link_speed(speed_mbps: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::default_route_badge;
+    use super::{default_route_badge, is_wallpaper_file};
     use crate::modules::system_controls::{ActiveNetwork, NetworkKind, NetworkSettings};
 
     fn network(default_ipv4: bool, default_ipv6: bool) -> ActiveNetwork {
@@ -1263,5 +2568,12 @@ mod tests {
             default_route_badge(&network(true, true)),
             Some("✓ IPv4 / IPv6")
         );
+    }
+
+    #[test]
+    fn wallpaper_picker_only_shows_supported_media_files() {
+        assert!(is_wallpaper_file("wallpaper.PNG".as_ref()));
+        assert!(is_wallpaper_file("movie.mkv".as_ref()));
+        assert!(!is_wallpaper_file("notes.txt".as_ref()));
     }
 }

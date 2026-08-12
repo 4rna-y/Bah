@@ -13,8 +13,9 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{
-    App, AppContext, Bounds, Size, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowKind, WindowOptions, layer_shell::*, point, px,
+    App, AppContext, Bounds, Context, DisplayId, Render, Size, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowDecorations, WindowKind, WindowOptions, div, layer_shell::*, point,
+    prelude::*, px,
 };
 use gpui_platform::application;
 use log::{error, info, warn};
@@ -23,7 +24,6 @@ use crate::{
     bar::Bar,
     config::Config,
     config_window::ConfigWindow,
-    device_control_center::DeviceControlCenter,
     hyprland,
     modules::{
         notifications::{NotificationStore, start_server},
@@ -34,12 +34,11 @@ use crate::{
 };
 
 const CONFIG_WINDOW_LOCK_FILE: &str = "bah/config-window.lock";
-const DEVICE_CONTROL_CENTER_LOCK_FILE: &str = "bah/device-control-center.lock";
 const DEVICE_CONTROL_CENTER_SOCKET_FILE: &str = "bah/device-control-center.sock";
 const WALLPAPER_LOCK_FILE: &str = "bah/wallpaper.lock";
 const WALLPAPER_PID_FILE: &str = "bah/wallpaper.pid";
 const USAGE: &str = "usage: bah [--memusg] [--wgpu-backend BACKENDS] [--vk-driver-files PATH] \
-     [window config|window device-control-center|wallpaper [set PATH|unset]]";
+     [notifications COMMAND|window config|window device-control-center [network|bluetooth|display]|wallpaper [set PATH|unset]]";
 
 /// Options that must be applied before GPUI initializes its graphics backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -166,6 +165,13 @@ fn encode_hex_ssid(ssid: &[u8]) -> String {
 
 /// Opens the network page without blocking a UI render callback.
 pub fn launch_device_control_center_network(ssid: Option<Vec<u8>>) {
+    launch_device_control_center(DeviceControlCenterRoute {
+        page: DeviceControlCenterPage::Network,
+        ssid,
+    });
+}
+
+fn launch_device_control_center(route: DeviceControlCenterRoute) {
     let _ = thread::Builder::new()
         .name("bah-device-control-center-launch".to_string())
         .spawn(move || {
@@ -177,8 +183,8 @@ pub fn launch_device_control_center_network(ssid: Option<Vec<u8>>) {
                 }
             };
             let mut command = Command::new(executable);
-            command.args(["window", "device-control-center", "network"]);
-            if let Some(ssid) = ssid {
+            command.args(["window", "device-control-center", route.page.as_arg()]);
+            if let Some(ssid) = route.ssid {
                 command.args(["--ssid-hex", &encode_hex_ssid(&ssid)]);
             }
             if let Err(error) = command.spawn() {
@@ -193,13 +199,29 @@ fn device_control_center_socket_path() -> io::Result<PathBuf> {
 
 fn write_device_control_center_route(route: &DeviceControlCenterRoute) -> io::Result<()> {
     let mut stream = UnixStream::connect(device_control_center_socket_path()?)?;
-    let payload = route
-        .ssid
-        .as_deref()
-        .map(encode_hex_ssid)
-        .unwrap_or_default();
+    let payload = match route.page {
+        DeviceControlCenterPage::Network => route
+            .ssid
+            .as_deref()
+            .map(|ssid| format!("network:{}", encode_hex_ssid(ssid)))
+            .unwrap_or_else(|| "network".to_string()),
+        DeviceControlCenterPage::Bluetooth => "bluetooth".to_string(),
+        DeviceControlCenterPage::Display => "display".to_string(),
+    };
     stream.write_all(payload.as_bytes())?;
     stream.write_all(b"\n")
+}
+
+/// Requests the DCC from an in-process surface without launching another
+/// executable. The Bar owns the persistent popup parent and opens the DCC.
+pub(crate) fn request_device_control_center(route: DeviceControlCenterRoute) {
+    let _ = thread::Builder::new()
+        .name("bah-device-control-center-request".to_string())
+        .spawn(move || {
+            if let Err(error) = write_device_control_center_route(&route) {
+                error!("failed to request device control center: {error}");
+            }
+        });
 }
 
 fn start_device_control_center_route_server(
@@ -225,20 +247,31 @@ fn start_device_control_center_route_server(
                 if stream.read_to_string(&mut request).is_err() {
                     continue;
                 }
-                let ssid = match request.trim() {
-                    "" => None,
-                    value => match decode_hex_ssid(OsStr::new(value)) {
-                        Ok(ssid) => Some(ssid),
-                        Err(error) => {
-                            warn!("invalid device control center route: {error}");
-                            continue;
-                        }
+                let route = match request.trim() {
+                    "" | "network" => DeviceControlCenterRoute::default(),
+                    "bluetooth" => DeviceControlCenterRoute {
+                        page: DeviceControlCenterPage::Bluetooth,
+                        ssid: None,
                     },
+                    "display" => DeviceControlCenterRoute {
+                        page: DeviceControlCenterPage::Display,
+                        ssid: None,
+                    },
+                    value => {
+                        let value = value.strip_prefix("network:").unwrap_or(value);
+                        match decode_hex_ssid(OsStr::new(value)) {
+                            Ok(ssid) => DeviceControlCenterRoute {
+                                page: DeviceControlCenterPage::Network,
+                                ssid: Some(ssid),
+                            },
+                            Err(error) => {
+                                warn!("invalid device control center route: {error}");
+                                continue;
+                            }
+                        }
+                    }
                 };
-                if sender
-                    .send_blocking(DeviceControlCenterRoute { ssid })
-                    .is_err()
-                {
+                if sender.send_blocking(route).is_err() {
                     return;
                 }
             }
@@ -266,13 +299,33 @@ pub enum RunMode {
     Bar,
     ConfigWindow,
     DeviceControlCenter(DeviceControlCenterRoute),
+    Notifications(Vec<OsString>),
     Wallpaper,
     WallpaperSet(PathBuf),
     WallpaperUnset,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum DeviceControlCenterPage {
+    #[default]
+    Network,
+    Bluetooth,
+    Display,
+}
+
+impl DeviceControlCenterPage {
+    fn as_arg(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Bluetooth => "bluetooth",
+            Self::Display => "display",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct DeviceControlCenterRoute {
+    pub page: DeviceControlCenterPage,
     pub ssid: Option<Vec<u8>>,
 }
 
@@ -288,6 +341,9 @@ impl RunMode {
             .collect::<Vec<_>>();
         match arguments.as_slice() {
             [] => Ok(Self::Bar),
+            [notifications, command @ ..] if notifications == "notifications" => {
+                Ok(Self::Notifications(command.to_vec()))
+            }
             [window, config] if window == "window" && config == "config" => Ok(Self::ConfigWindow),
             [window, device_control_center]
                 if window == "window" && device_control_center == "device-control-center" =>
@@ -305,6 +361,26 @@ impl RunMode {
                     DeviceControlCenterRoute::default(),
                 ))
             }
+            [window, device_control_center, bluetooth]
+                if window == "window"
+                    && device_control_center == "device-control-center"
+                    && bluetooth == "bluetooth" =>
+            {
+                Ok(Self::DeviceControlCenter(DeviceControlCenterRoute {
+                    page: DeviceControlCenterPage::Bluetooth,
+                    ssid: None,
+                }))
+            }
+            [window, device_control_center, display]
+                if window == "window"
+                    && device_control_center == "device-control-center"
+                    && display == "display" =>
+            {
+                Ok(Self::DeviceControlCenter(DeviceControlCenterRoute {
+                    page: DeviceControlCenterPage::Display,
+                    ssid: None,
+                }))
+            }
             [window, device_control_center, network, flag, ssid]
                 if window == "window"
                     && device_control_center == "device-control-center"
@@ -312,6 +388,7 @@ impl RunMode {
                     && flag == "--ssid-hex" =>
             {
                 Ok(Self::DeviceControlCenter(DeviceControlCenterRoute {
+                    page: DeviceControlCenterPage::Network,
                     ssid: Some(decode_hex_ssid(ssid)?),
                 }))
             }
@@ -333,6 +410,7 @@ pub fn run(mode: RunMode, config: Config) {
         RunMode::Bar => run_bar(config),
         RunMode::ConfigWindow => run_config_window(config),
         RunMode::DeviceControlCenter(route) => run_device_control_center(route),
+        RunMode::Notifications(arguments) => run_notifications(arguments),
         RunMode::Wallpaper => run_wallpaper(config),
         RunMode::WallpaperSet(_) | RunMode::WallpaperUnset => {
             unreachable!("commands exit before run")
@@ -372,12 +450,21 @@ fn canonical_wallpaper_path(path: &Path) -> Result<PathBuf> {
 
 fn replace_wallpaper_process() -> Result<()> {
     stop_wallpaper_process()?;
+    start_wallpaper_process()
+}
+
+fn start_wallpaper_process() -> Result<()> {
     let executable = env::current_exe().context("failed to resolve bah executable")?;
     Command::new(executable)
         .arg("wallpaper")
         .spawn()
         .context("failed to start wallpaper layer")?;
     Ok(())
+}
+
+/// Restarts the wallpaper layer after a settings-page update.
+pub(crate) fn restart_wallpaper_process() -> Result<()> {
+    replace_wallpaper_process()
 }
 
 fn stop_wallpaper_process() -> Result<()> {
@@ -432,17 +519,40 @@ fn runtime_wallpaper_pid_path() -> io::Result<PathBuf> {
     runtime_lock_path(WALLPAPER_PID_FILE)
 }
 
+struct WallpaperBootstrap;
+
+impl Render for WallpaperBootstrap {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full()
+    }
+}
+
 fn run_wallpaper(config: Config) {
-    let Some(source) = config.wallpaper else {
+    let fallback = config.wallpaper.clone();
+    let surfaces = match hyprland::display::load_layout() {
+        Ok(layout) => {
+            hyprland::display::wallpaper_sources(&layout, &config.wallpapers, fallback.as_ref())
+                .into_iter()
+                .map(|(output, source)| (Some(output), source))
+                .collect::<Vec<_>>()
+        }
+        Err(error) => {
+            warn!("could not determine outputs for wallpapers: {error}");
+            fallback.into_iter().map(|source| (None, source)).collect()
+        }
+    };
+    if surfaces.is_empty() {
         info!("no wallpaper configured; wallpaper layer will not be created");
         return;
-    };
-    if !source.is_file() {
-        error!(
-            "configured wallpaper no longer exists: {}",
-            source.display()
-        );
-        return;
+    }
+    for (_, source) in &surfaces {
+        if !source.is_file() {
+            error!(
+                "configured wallpaper no longer exists: {}",
+                source.display()
+            );
+            return;
+        }
     }
     let lock = match WallpaperLock::acquire() {
         Ok(Some(lock)) => lock,
@@ -464,19 +574,23 @@ fn run_wallpaper(config: Config) {
         Ok(()) => {}
         Err(error) => error!("could not record wallpaper process: {error}"),
     }
+    let lock = std::sync::Arc::new(lock.into_file());
     application().run(move |cx: &mut App| {
-        let result = cx.open_window(
+        // wl_output names arrive asynchronously. Keep one transparent layer
+        // surface alive until the initial Wayland output events have been
+        // processed, then map the per-output wallpaper surfaces.
+        let bootstrap = cx.open_window(
             WindowOptions {
                 titlebar: None,
                 focus: false,
-                app_id: Some("bah-wallpaper".to_string()),
-                window_background: WindowBackgroundAppearance::Opaque,
+                app_id: Some("bah-wallpaper-bootstrap".to_string()),
+                window_background: WindowBackgroundAppearance::Transparent,
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: point(px(0.0), px(0.0)),
                     size: Size::new(px(1.0), px(1.0)),
                 })),
                 kind: WindowKind::LayerShell(LayerShellOptions {
-                    namespace: "bah-wallpaper".to_string(),
+                    namespace: "bah-wallpaper-bootstrap".to_string(),
                     layer: Layer::Bottom,
                     anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
                     keyboard_interactivity: KeyboardInteractivity::None,
@@ -484,11 +598,33 @@ fn run_wallpaper(config: Config) {
                 }),
                 ..Default::default()
             },
-            move |_, cx| cx.new(|cx| Wallpaper::new(source.clone(), lock.into_file(), cx)),
+            move |window, cx| {
+                let surfaces = surfaces.clone();
+                let lock = lock.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        for _ in 0..20 {
+                            let ready = cx
+                                .update(|_, cx| wallpaper_outputs_ready(cx, &surfaces))
+                                .unwrap_or(false);
+                            if ready {
+                                break;
+                            }
+                            cx.background_executor()
+                                .timer(Duration::from_millis(100))
+                                .await;
+                        }
+                        let _ = cx.update(move |window, cx| {
+                            open_wallpaper_surfaces(cx, &surfaces, &lock);
+                            window.remove_window();
+                        });
+                    })
+                    .detach();
+                cx.new(|_| WallpaperBootstrap)
+            },
         );
-        match result {
-            Ok(_) => info!("wallpaper Layer Shell window created"),
-            Err(error) => error!("failed to create wallpaper Layer Shell window: {error}"),
+        if let Err(error) = bootstrap {
+            error!("failed to create wallpaper bootstrap surface: {error}");
         }
     });
     if let Ok(path) = runtime_wallpaper_pid_path() {
@@ -496,14 +632,90 @@ fn run_wallpaper(config: Config) {
     }
 }
 
+fn wallpaper_outputs_ready(cx: &App, surfaces: &[(Option<String>, PathBuf)]) -> bool {
+    surfaces.iter().all(|(output, _)| {
+        output
+            .as_deref()
+            .is_none_or(|output| display_id_for_output(cx, output).is_some())
+    })
+}
+
+fn open_wallpaper_surfaces(
+    cx: &mut App,
+    surfaces: &[(Option<String>, PathBuf)],
+    lock: &std::sync::Arc<File>,
+) {
+    for (output, source) in surfaces {
+        let display_id = output
+            .as_deref()
+            .and_then(|output| display_id_for_output(cx, output));
+        if output.is_some() && display_id.is_none() {
+            warn!("could not find Wayland output for wallpaper {:?}", output);
+            continue;
+        }
+        let source = source.clone();
+        let lock = lock.clone();
+        let namespace = output.as_ref().map_or_else(
+            || "bah-wallpaper".to_string(),
+            |output| format!("bah-wallpaper-{output}"),
+        );
+        let result = cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                focus: false,
+                display_id,
+                app_id: Some("bah-wallpaper".to_string()),
+                window_background: WindowBackgroundAppearance::Opaque,
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: Size::new(px(1.0), px(1.0)),
+                })),
+                kind: WindowKind::LayerShell(LayerShellOptions {
+                    namespace,
+                    layer: Layer::Bottom,
+                    anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                    keyboard_interactivity: KeyboardInteractivity::None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|cx| Wallpaper::new(source.clone(), lock.clone(), cx)),
+        );
+        match result {
+            Ok(_) => info!("wallpaper Layer Shell window created"),
+            Err(error) => error!("failed to create wallpaper Layer Shell window: {error}"),
+        }
+    }
+}
+
+fn display_id_for_output(cx: &App, output: &str) -> Option<DisplayId> {
+    let expected = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, output.as_bytes());
+    cx.displays()
+        .into_iter()
+        .find_map(|display| (display.uuid().ok() == Some(expected)).then(|| display.id()))
+}
+
 fn run_bar(config: Config) {
+    if wallpaper_is_configured(&config)
+        && let Err(error) = start_wallpaper_process()
+    {
+        error!("could not start configured wallpaper: {error}");
+    }
     application().run(move |cx: &mut App| {
         let (sender, receiver) = async_channel::unbounded();
         hyprland::start_worker(sender);
         let (notification_sender, notification_receiver) = async_channel::unbounded();
-        start_server(notification_sender.clone());
-        let notifications = NotificationStore::shared();
+        let notifications = NotificationStore::shared(config.notifications.clone());
+        start_server(notification_sender.clone(), notifications.clone());
         let controls = system_controls::start_worker();
+        let (dcc_route_sender, dcc_route_receiver) = async_channel::unbounded();
+        let dcc_route_server = match start_device_control_center_route_server(dcc_route_sender) {
+            Ok(server) => server,
+            Err(error) => {
+                error!("could not start device control center route server: {error}");
+                return;
+            }
+        };
 
         let theme = BarTheme::from_environment(config.bar_height);
         let height = theme.bar_height;
@@ -520,6 +732,41 @@ fn run_bar(config: Config) {
                 ""
             }
         );
+        // Wayland popups are positioned in their parent's surface-local
+        // coordinate space. Keep a full-output parent mapped for the lifetime
+        // of the bar so the DCC popup can use the monitor centre directly.
+        let dcc_popup_anchor = match cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                focus: false,
+                show: true,
+                is_movable: false,
+                is_resizable: false,
+                app_id: Some("bah-device-control-center-anchor".to_string()),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_decorations: Some(WindowDecorations::Client),
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: Size::new(px(1.0), px(1.0)),
+                })),
+                kind: WindowKind::LayerShell(LayerShellOptions {
+                    namespace: "bah-device-control-center-anchor".to_string(),
+                    layer: Layer::Overlay,
+                    anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                    exclusive_zone: Some(px(0.0)),
+                    keyboard_interactivity: KeyboardInteractivity::None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |_, cx| cx.new(|_| crate::bar::DeviceControlCenterAnchor),
+        ) {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                error!("failed to create device control center popup anchor: {error}");
+                return;
+            }
+        };
         let result = cx.open_window(
             WindowOptions {
                 titlebar: None,
@@ -550,6 +797,9 @@ fn run_bar(config: Config) {
                         notification_sender,
                         notifications,
                         controls,
+                        dcc_route_receiver,
+                        dcc_route_server,
+                        dcc_popup_anchor,
                         theme,
                         cx,
                     )
@@ -564,72 +814,21 @@ fn run_bar(config: Config) {
     });
 }
 
+fn wallpaper_is_configured(config: &Config) -> bool {
+    config.wallpaper.is_some() || !config.wallpapers.is_empty()
+}
+
 fn run_device_control_center(route: DeviceControlCenterRoute) {
-    let lock = match DeviceControlCenterLock::acquire() {
-        Ok(Some(lock)) => lock,
-        Ok(None) => {
-            for _ in 0..20 {
-                if write_device_control_center_route(&route).is_ok() {
-                    info!("routed request to existing device control center window");
-                    return;
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            warn!("a device control center window is already open but cannot receive routes");
-            return;
-        }
-        Err(error) => {
-            error!("could not lock device control center window: {error}");
-            return;
-        }
-    };
-    let (route_sender, route_receiver) = async_channel::unbounded();
-    let route_server = match start_device_control_center_route_server(route_sender) {
-        Ok(server) => server,
-        Err(error) => {
-            error!("could not start device control center route server: {error}");
-            return;
-        }
-    };
+    if let Err(error) = write_device_control_center_route(&route) {
+        error!("Bar is not running; cannot open the device control center popover: {error}");
+    }
+}
 
-    application().run(move |cx: &mut App| {
-        let size = Size::new(px(900.0), px(650.0));
-        let result = cx.open_window(
-            WindowOptions {
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("bah Device Control Center".into()),
-                    appears_transparent: false,
-                    traffic_light_position: None,
-                }),
-                focus: true,
-                show: true,
-                is_movable: true,
-                kind: WindowKind::Normal,
-                window_background: WindowBackgroundAppearance::Opaque,
-                app_id: Some("bah-device-control-center".to_string()),
-                window_decorations: Some(WindowDecorations::Server),
-                window_bounds: Some(WindowBounds::centered(size, cx)),
-                window_min_size: Some(Size::new(px(480.0), px(320.0))),
-                ..Default::default()
-            },
-            move |_, cx| {
-                cx.new(|cx| {
-                    DeviceControlCenter::new(lock, route.clone(), route_receiver, route_server, cx)
-                })
-            },
-        );
-
-        match result {
-            Ok(_) => {
-                hyprland::force_float_window_for_process(
-                    "bah-device-control-center",
-                    std::process::id(),
-                );
-                info!("device control center window created")
-            }
-            Err(error) => error!("failed to create device control center window: {error}"),
-        }
-    });
+fn run_notifications(arguments: Vec<OsString>) {
+    if let Err(error) = crate::modules::notifications::run_control_cli(&arguments) {
+        eprintln!("bah notifications: {error}");
+        std::process::exit(1);
+    }
 }
 
 fn run_config_window(config: Config) {
@@ -756,37 +955,6 @@ fn config_window_lock_path() -> io::Result<PathBuf> {
     Ok(root.join(CONFIG_WINDOW_LOCK_FILE))
 }
 
-/// Advisory lock held for the lifetime of the device-control-center window.
-pub struct DeviceControlCenterLock {
-    _file: File,
-}
-
-impl DeviceControlCenterLock {
-    fn acquire() -> io::Result<Option<Self>> {
-        let path = runtime_lock_path(DEVICE_CONTROL_CENTER_LOCK_FILE)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
-        if result == 0 {
-            Ok(Some(Self { _file: file }))
-        } else {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(11) {
-                Ok(None)
-            } else {
-                Err(error)
-            }
-        }
-    }
-}
-
 fn runtime_lock_path(name: &str) -> io::Result<PathBuf> {
     let root = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -806,7 +974,26 @@ const SIGTERM: i32 = 15;
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceControlCenterRoute, RunMode, StartupOptions};
+    use std::path::PathBuf;
+
+    use super::{
+        DeviceControlCenterPage, DeviceControlCenterRoute, RunMode, StartupOptions,
+        wallpaper_is_configured,
+    };
+    use crate::config::Config;
+
+    #[test]
+    fn wallpaper_startup_detects_common_and_output_specific_settings() {
+        let mut config = Config::default();
+        assert!(!wallpaper_is_configured(&config));
+        config.wallpaper = Some(PathBuf::from("wallpaper.png"));
+        assert!(wallpaper_is_configured(&config));
+        config.wallpaper = None;
+        config
+            .wallpapers
+            .insert("eDP-1".into(), PathBuf::from("display.png"));
+        assert!(wallpaper_is_configured(&config));
+    }
 
     #[test]
     fn parses_supported_invocations() {
@@ -830,7 +1017,22 @@ mod tests {
                 "77696669",
             ]),
             Ok(RunMode::DeviceControlCenter(DeviceControlCenterRoute {
+                page: DeviceControlCenterPage::Network,
                 ssid: Some(b"wifi".to_vec()),
+            }))
+        );
+        assert_eq!(
+            RunMode::from_args(["window", "device-control-center", "bluetooth"]),
+            Ok(RunMode::DeviceControlCenter(DeviceControlCenterRoute {
+                page: DeviceControlCenterPage::Bluetooth,
+                ssid: None,
+            }))
+        );
+        assert_eq!(
+            RunMode::from_args(["window", "device-control-center", "display"]),
+            Ok(RunMode::DeviceControlCenter(DeviceControlCenterRoute {
+                page: DeviceControlCenterPage::Display,
+                ssid: None,
             }))
         );
         assert_eq!(RunMode::from_args(["wallpaper"]), Ok(RunMode::Wallpaper));

@@ -2,19 +2,24 @@
 name = "bah"
 version = "0.1.0"
 edition = "2024"
+default-run = "bah"
 
 [dependencies]
 anyhow = "1.0"
 async-channel = "2.5"
+bluer = { version = "0.17.4", features = ["full"] }
 chrono = { version = "0.4", default-features = true }
 env_logger = "0.11"
 gpui = { git = "https://github.com/4rna-y/zed", rev = "f005b687a4287536540fe71b898fe63a176ed0d3", default-features = false, features = ["wayland"] }
 gpui_platform = { git = "https://github.com/4rna-y/zed", rev = "f005b687a4287536540fe71b898fe63a176ed0d3", default-features = false, features = ["wayland"] }
 image = "0.25"
+librepods = { path = "../librepods/linux-rust" }
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v5"] }
 zbus = "5.18"
 
 [profile.dev]

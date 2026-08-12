@@ -1,0 +1,15 @@
+bar_height = 36.0
+
+[wallpapers]
+eDP-1 = "/home/rg/Pictures/wallpaper/wallpaper.png"
+
+[notifications]
+enabled = true
+popup_width = 360.0
+notification_limit = 20
+history_length = 20
+low_timeout_seconds = 10
+normal_timeout_seconds = 10
+critical_timeout_seconds = 0
+pause_level = 0
+rules = []

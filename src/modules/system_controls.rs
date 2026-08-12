@@ -10,6 +10,8 @@ use std::{
 
 use async_channel::{Receiver, Sender};
 use log::{debug, error, warn};
+
+use super::airpods::{AirPodsCommand, AirPodsControls, AirPodsListeningMode, AirPodsStatus};
 use zbus::{
     blocking::{Connection, Proxy},
     fdo::ManagedObjects,
@@ -26,6 +28,7 @@ const NM_802_11_AP_FLAGS_PRIVACY: u32 = 0x1;
 const NM_802_11_AP_SEC_KEY_MGMT_PSK: u32 = 0x100;
 const NM_802_11_AP_SEC_KEY_MGMT_802_1X: u32 = 0x200;
 const NM_802_11_AP_SEC_KEY_MGMT_SAE: u32 = 0x400;
+const AIRPODS_SERVICE_UUID: &str = "74ec2172-0bad-4d01-8f77-997b2be0722a";
 
 type NmConnectionSettings = HashMap<String, HashMap<String, OwnedValue>>;
 
@@ -44,6 +47,7 @@ impl AudioEndpoint {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlAction {
     ToggleWifi,
@@ -57,6 +61,17 @@ pub enum ControlAction {
         settings: NetworkSettings,
     },
     ToggleBluetooth,
+    SetBluetoothDiscovery(bool),
+    SetAirPodsListeningMode(AirPodsListeningMode),
+    ConnectBluetooth {
+        device_path: String,
+    },
+    DisconnectBluetooth {
+        device_path: String,
+    },
+    PairBluetooth {
+        device_path: String,
+    },
     ToggleMute(AudioEndpoint),
     SetVolume(AudioEndpoint, u8),
     SetBrightness(u8),
@@ -78,6 +93,63 @@ pub struct WifiNetwork {
     pub connected: bool,
     pub saved: bool,
     pub security: WifiSecurity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BluetoothDevice {
+    /// BlueZ object path. It remains stable for the lifetime of the discovered device.
+    pub path: String,
+    pub label: String,
+    pub address: String,
+    pub paired: bool,
+    pub connected: bool,
+    pub trusted: bool,
+    pub rssi: Option<i16>,
+    pub is_airpods: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BluetoothPairingPrompt {
+    PinCode,
+    Passkey,
+    Confirmation { passkey: u32 },
+    DisplayPinCode { pin_code: String },
+    DisplayPasskey { passkey: u32 },
+    Authorization,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BluetoothPairingResponse {
+    PinCode {
+        device_path: String,
+        pin_code: String,
+    },
+    Confirm {
+        device_path: String,
+        accepted: bool,
+    },
+    Cancel {
+        device_path: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BluetoothEvent {
+    OperationStarted {
+        device_path: String,
+        pairing: bool,
+    },
+    PairingPrompt {
+        device_path: String,
+        prompt: BluetoothPairingPrompt,
+    },
+    Succeeded {
+        device_path: String,
+    },
+    Failed {
+        device_path: String,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -441,6 +513,8 @@ fn nmcli_error(output: &std::process::Output, fallback: &str) -> String {
 pub struct ToggleStatus {
     pub available: bool,
     pub enabled: bool,
+    /// Whether the control currently has an active connection.
+    pub connected: bool,
     pub wired: bool,
     pub signal_strength: Option<u8>,
     pub interface: Option<String>,
@@ -454,6 +528,7 @@ impl ToggleStatus {
         Self {
             available: false,
             enabled: false,
+            connected: false,
             wired: false,
             signal_strength: None,
             interface: None,
@@ -569,6 +644,8 @@ pub struct ControlSnapshot {
     pub active_networks: Vec<ActiveNetwork>,
     pub primary_network: Option<NetworkRoute>,
     pub bluetooth: ToggleStatus,
+    pub bluetooth_devices: Vec<BluetoothDevice>,
+    pub airpods: AirPodsStatus,
     pub cpu: CpuStatus,
     pub memory: MemoryStatus,
     pub audio_output: LevelStatus,
@@ -583,6 +660,8 @@ pub struct ControlChannels {
     pub updates: Receiver<ControlSnapshot>,
     pub wifi_events: Receiver<WifiConnectionEvent>,
     pub network_settings_events: Receiver<NetworkSettingsEvent>,
+    pub bluetooth_events: Receiver<BluetoothEvent>,
+    pub bluetooth_pairing_responses: Sender<BluetoothPairingResponse>,
 }
 
 impl Default for ControlSnapshot {
@@ -595,6 +674,8 @@ impl Default for ControlSnapshot {
             active_networks: Vec::new(),
             primary_network: None,
             bluetooth: ToggleStatus::unavailable(),
+            bluetooth_devices: Vec::new(),
+            airpods: AirPodsStatus::default(),
             cpu: CpuStatus::unavailable(),
             memory: MemoryStatus::unavailable(),
             audio_output: LevelStatus::unavailable(),
@@ -613,6 +694,11 @@ pub fn start_worker() -> ControlChannels {
     let (wifi_event_sender, wifi_event_receiver) = async_channel::unbounded();
     let (network_settings_event_sender, network_settings_event_receiver) =
         async_channel::unbounded();
+    let (bluetooth_event_sender, bluetooth_event_receiver) = async_channel::unbounded();
+    let (bluetooth_pairing_response_sender, bluetooth_pairing_response_receiver) =
+        async_channel::unbounded();
+    let airpods = super::airpods::start_worker();
+    let airpods_for_worker = airpods.clone();
 
     if let Err(error) = thread::Builder::new()
         .name("bah-system-controls".to_string())
@@ -622,6 +708,9 @@ pub fn start_worker() -> ControlChannels {
                 snapshot_sender,
                 wifi_event_sender,
                 network_settings_event_sender,
+                bluetooth_event_sender,
+                bluetooth_pairing_response_receiver,
+                airpods_for_worker,
             )
         })
     {
@@ -633,6 +722,8 @@ pub fn start_worker() -> ControlChannels {
         updates: snapshot_receiver,
         wifi_events: wifi_event_receiver,
         network_settings_events: network_settings_event_receiver,
+        bluetooth_events: bluetooth_event_receiver,
+        bluetooth_pairing_responses: bluetooth_pairing_response_sender,
     }
 }
 
@@ -641,10 +732,18 @@ fn run_worker(
     snapshots: Sender<ControlSnapshot>,
     wifi_events: Sender<WifiConnectionEvent>,
     network_settings_events: Sender<NetworkSettingsEvent>,
+    bluetooth_events: Sender<BluetoothEvent>,
+    bluetooth_pairing_responses: Receiver<BluetoothPairingResponse>,
+    airpods: AirPodsControls,
 ) {
-    let mut backend = SystemBackend::new();
+    let mut backend = SystemBackend::new(bluetooth_events.clone(), bluetooth_pairing_responses);
     let mut discovery_enabled = false;
-    let mut current = backend.snapshot(discovery_enabled);
+    let mut bluetooth_discovery_enabled = false;
+    let mut current = backend.snapshot(
+        discovery_enabled,
+        bluetooth_discovery_enabled,
+        &airpods.status,
+    );
     if snapshots.send_blocking(current.clone()).is_err() {
         return;
     }
@@ -659,6 +758,29 @@ fn run_worker(
                     discovery_enabled = enabled;
                     if enabled {
                         backend.request_wifi_scan();
+                    }
+                }
+                ControlAction::SetBluetoothDiscovery(enabled) => {
+                    bluetooth_discovery_enabled = enabled;
+                    if enabled {
+                        backend.request_bluetooth_discovery();
+                    } else {
+                        backend.stop_bluetooth_discovery();
+                    }
+                }
+                ControlAction::SetAirPodsListeningMode(mode) => {
+                    if airpods
+                        .commands
+                        .send_blocking(AirPodsCommand::SetListeningMode(mode))
+                        .is_err()
+                    {
+                        warn!("AirPods command worker unavailable");
+                        let mut status = airpods
+                            .status
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        status.message =
+                            Some("AirPodsへの操作要求を送信できませんでした".to_string());
                     }
                 }
                 ControlAction::ConnectWifi { ssid, password } => {
@@ -691,11 +813,56 @@ fn run_worker(
                             });
                     }
                 },
+                action @ (ControlAction::ConnectBluetooth { .. }
+                | ControlAction::DisconnectBluetooth { .. }
+                | ControlAction::PairBluetooth { .. }) => {
+                    let (device_path, pairing) = match &action {
+                        ControlAction::ConnectBluetooth { device_path }
+                        | ControlAction::DisconnectBluetooth { device_path } => {
+                            (device_path.clone(), false)
+                        }
+                        ControlAction::PairBluetooth { device_path } => (device_path.clone(), true),
+                        _ => unreachable!(),
+                    };
+                    let _ = bluetooth_events.send_blocking(BluetoothEvent::OperationStarted {
+                        device_path: device_path.clone(),
+                        pairing,
+                    });
+                    let result = match action {
+                        ControlAction::ConnectBluetooth { .. } => {
+                            backend.connect_bluetooth(&device_path)
+                        }
+                        ControlAction::DisconnectBluetooth { .. } => {
+                            backend.disconnect_bluetooth(&device_path)
+                        }
+                        ControlAction::PairBluetooth { .. } => backend.pair_bluetooth(&device_path),
+                        _ => unreachable!(),
+                    };
+                    match result {
+                        Ok(()) => {
+                            let _ = bluetooth_events
+                                .send_blocking(BluetoothEvent::Succeeded { device_path });
+                        }
+                        Err(message) => {
+                            let _ = bluetooth_events.send_blocking(BluetoothEvent::Failed {
+                                device_path,
+                                message,
+                            });
+                        }
+                    }
+                }
                 action => match backend.apply(&current, action.clone()) {
                     Ok(()) => match action {
                         ControlAction::ToggleWifi => current.wifi.enabled = !current.wifi.enabled,
                         ControlAction::ToggleBluetooth => {
-                            current.bluetooth.enabled = !current.bluetooth.enabled
+                            current.bluetooth.enabled = !current.bluetooth.enabled;
+                            if bluetooth_discovery_enabled {
+                                if current.bluetooth.enabled {
+                                    backend.request_bluetooth_discovery();
+                                } else {
+                                    backend.stop_bluetooth_discovery();
+                                }
+                            }
                         }
                         ControlAction::ToggleMute(AudioEndpoint::Output) => {
                             current.audio_output.muted = !current.audio_output.muted
@@ -714,7 +881,12 @@ fn run_worker(
                         }
                         ControlAction::SetWifiDiscovery(_)
                         | ControlAction::ConnectWifi { .. }
-                        | ControlAction::UpdateNetworkSettings { .. } => {}
+                        | ControlAction::UpdateNetworkSettings { .. }
+                        | ControlAction::SetBluetoothDiscovery(_)
+                        | ControlAction::SetAirPodsListeningMode(_)
+                        | ControlAction::ConnectBluetooth { .. }
+                        | ControlAction::DisconnectBluetooth { .. }
+                        | ControlAction::PairBluetooth { .. } => {}
                     },
                     Err(error) => warn!("system control action failed: {error}"),
                 },
@@ -722,7 +894,11 @@ fn run_worker(
         }
 
         if handled_action || refreshed_at.elapsed() >= REFRESH_INTERVAL {
-            current = backend.snapshot(discovery_enabled);
+            current = backend.snapshot(
+                discovery_enabled,
+                bluetooth_discovery_enabled,
+                &airpods.status,
+            );
             refreshed_at = Instant::now();
             if snapshots.send_blocking(current.clone()).is_err() {
                 return;
@@ -738,10 +914,15 @@ struct SystemBackend {
     battery: Option<BatteryDevice>,
     network_traffic: NetworkTrafficSampler,
     cpu_usage: CpuUsageSampler,
+    bluetooth_pairing: Option<BluetoothPairingClient>,
+    bluetooth_discovery_active: bool,
 }
 
 impl SystemBackend {
-    fn new() -> Self {
+    fn new(
+        bluetooth_events: Sender<BluetoothEvent>,
+        bluetooth_pairing_responses: Receiver<BluetoothPairingResponse>,
+    ) -> Self {
         let system_bus = Connection::system()
             .map_err(|error| warn!("system D-Bus unavailable: {error}"))
             .ok();
@@ -753,10 +934,22 @@ impl SystemBackend {
             battery,
             network_traffic: NetworkTrafficSampler::default(),
             cpu_usage: CpuUsageSampler::new(),
+            bluetooth_pairing: BluetoothPairingClient::new(
+                bluetooth_events,
+                bluetooth_pairing_responses,
+            )
+            .map_err(|error| warn!("Bluetooth pairing agent unavailable: {error}"))
+            .ok(),
+            bluetooth_discovery_active: false,
         }
     }
 
-    fn snapshot(&mut self, include_wifi_networks: bool) -> ControlSnapshot {
+    fn snapshot(
+        &mut self,
+        include_wifi_networks: bool,
+        include_bluetooth_devices: bool,
+        airpods: &std::sync::Arc<std::sync::Mutex<AirPodsStatus>>,
+    ) -> ControlSnapshot {
         let mut wifi = self.wifi_status().unwrap_or_else(|error| {
             debug!("could not read NetworkManager state: {error}");
             ToggleStatus::unavailable()
@@ -793,6 +986,20 @@ impl SystemBackend {
             .as_ref()
             .map(|route| route.interface.clone());
 
+        let bluetooth = self.bluetooth_status().unwrap_or_else(|error| {
+            debug!("could not read BlueZ state: {error}");
+            ToggleStatus::unavailable()
+        });
+        let bluetooth_devices =
+            if include_bluetooth_devices && bluetooth.available && bluetooth.enabled {
+                self.bluetooth_devices().unwrap_or_else(|error| {
+                    debug!("could not read Bluetooth devices: {error}");
+                    Vec::new()
+                })
+            } else {
+                Vec::new()
+            };
+
         ControlSnapshot {
             wifi,
             wired_active,
@@ -800,10 +1007,12 @@ impl SystemBackend {
             wifi_networks,
             active_networks,
             primary_network,
-            bluetooth: self.bluetooth_status().unwrap_or_else(|error| {
-                debug!("could not read BlueZ state: {error}");
-                ToggleStatus::unavailable()
-            }),
+            bluetooth,
+            bluetooth_devices,
+            airpods: airpods
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             cpu: self.cpu_usage.sample(),
             memory: memory_usage(),
             audio_output: read_wpctl(AudioEndpoint::Output).unwrap_or_else(|error| {
@@ -841,7 +1050,12 @@ impl SystemBackend {
             ControlAction::SetBrightness(percent) => self.set_brightness(percent.min(100)),
             ControlAction::SetWifiDiscovery(_)
             | ControlAction::ConnectWifi { .. }
-            | ControlAction::UpdateNetworkSettings { .. } => Ok(()),
+            | ControlAction::UpdateNetworkSettings { .. }
+            | ControlAction::SetBluetoothDiscovery(_)
+            | ControlAction::SetAirPodsListeningMode(_)
+            | ControlAction::ConnectBluetooth { .. }
+            | ControlAction::DisconnectBluetooth { .. }
+            | ControlAction::PairBluetooth { .. } => Ok(()),
         }
     }
 
@@ -1525,7 +1739,8 @@ impl SystemBackend {
             }
         }
 
-        let wired = enabled && wifi_label.is_none() && ethernet_active;
+        let connected = wifi_label.is_some();
+        let wired = enabled && !connected && ethernet_active;
         let label = if !enabled {
             "Off".to_string()
         } else if let Some(ssid) = wifi_label {
@@ -1538,6 +1753,7 @@ impl SystemBackend {
         Ok(ToggleStatus {
             available: true,
             enabled,
+            connected,
             wired,
             signal_strength: wifi_signal_strength,
             interface: active_interface,
@@ -1601,6 +1817,7 @@ impl SystemBackend {
         Ok(ToggleStatus {
             available: true,
             enabled,
+            connected: !connected_names.is_empty(),
             wired: false,
             signal_strength: None,
             interface: None,
@@ -1624,6 +1841,139 @@ impl SystemBackend {
             .map_err(|error| error.to_string())?
             .set_property("Powered", enabled)
             .map_err(|error| error.to_string())
+    }
+
+    fn bluetooth_adapter_path(&self, objects: &ManagedObjects) -> Result<String, String> {
+        let mut paths = objects
+            .iter()
+            .filter(|(_, interfaces)| property_map(interfaces, "org.bluez.Adapter1").is_some())
+            .map(|(path, _)| path.as_str().to_string())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+            .into_iter()
+            .next()
+            .ok_or("no Bluetooth adapter".to_string())
+    }
+
+    fn bluetooth_devices(&self) -> Result<Vec<BluetoothDevice>, String> {
+        let objects = self.bluetooth_objects()?;
+        let adapter_path = self.bluetooth_adapter_path(&objects)?;
+        let device_prefix = format!("{adapter_path}/dev_");
+        let mut devices = objects
+            .iter()
+            .filter(|(path, _)| path.as_str().starts_with(&device_prefix))
+            .filter_map(|(path, interfaces)| {
+                let properties = property_map(interfaces, "org.bluez.Device1")?;
+                if owned_bool(properties.get("Blocked")) == Some(true) {
+                    return None;
+                }
+                let label = owned_string(properties.get("Alias"))
+                    .or_else(|| owned_string(properties.get("Name")))
+                    .filter(|label| !label.trim().is_empty())
+                    .unwrap_or_else(|| "Bluetooth device".to_string());
+                let is_airpods = properties
+                    .get("UUIDs")
+                    .and_then(|value| Vec::<String>::try_from(value.clone()).ok())
+                    .is_some_and(|uuids| {
+                        uuids
+                            .iter()
+                            .any(|uuid| uuid.eq_ignore_ascii_case(AIRPODS_SERVICE_UUID))
+                    });
+                Some(BluetoothDevice {
+                    path: path.as_str().to_string(),
+                    label,
+                    address: owned_string(properties.get("Address")).unwrap_or_default(),
+                    paired: owned_bool(properties.get("Paired")).unwrap_or(false),
+                    connected: owned_bool(properties.get("Connected")).unwrap_or(false),
+                    trusted: owned_bool(properties.get("Trusted")).unwrap_or(false),
+                    rssi: owned_i16(properties.get("RSSI")),
+                    is_airpods,
+                })
+            })
+            .collect::<Vec<_>>();
+        sort_bluetooth_devices(&mut devices);
+        Ok(devices)
+    }
+
+    fn request_bluetooth_discovery(&mut self) {
+        if self.bluetooth_discovery_active {
+            return;
+        }
+        let result = (|| -> Result<(), String> {
+            let connection = self.system_bus.as_ref().ok_or("system bus unavailable")?;
+            let objects = self.bluetooth_objects()?;
+            let adapter_path = self.bluetooth_adapter_path(&objects)?;
+            Proxy::new(connection, "org.bluez", adapter_path, "org.bluez.Adapter1")
+                .map_err(|error| error.to_string())?
+                .call::<_, _, ()>("StartDiscovery", &())
+                .map_err(|error| error.to_string())
+        })();
+        if let Err(error) = result {
+            debug!("could not start Bluetooth discovery: {error}");
+        } else {
+            self.bluetooth_discovery_active = true;
+        }
+    }
+
+    fn stop_bluetooth_discovery(&mut self) {
+        if !self.bluetooth_discovery_active {
+            return;
+        }
+        let result = (|| -> Result<(), String> {
+            let connection = self.system_bus.as_ref().ok_or("system bus unavailable")?;
+            let objects = self.bluetooth_objects()?;
+            let adapter_path = self.bluetooth_adapter_path(&objects)?;
+            Proxy::new(connection, "org.bluez", adapter_path, "org.bluez.Adapter1")
+                .map_err(|error| error.to_string())?
+                .call::<_, _, ()>("StopDiscovery", &())
+                .map_err(|error| error.to_string())
+        })();
+        if let Err(error) = result {
+            debug!("could not stop Bluetooth discovery: {error}");
+        }
+        self.bluetooth_discovery_active = false;
+    }
+
+    fn bluetooth_device_exists(&self, device_path: &str) -> Result<(), String> {
+        let objects = self.bluetooth_objects()?;
+        let adapter_path = self.bluetooth_adapter_path(&objects)?;
+        if !device_path.starts_with(&format!("{adapter_path}/dev_"))
+            || !objects.iter().any(|(path, interfaces)| {
+                path.as_str() == device_path
+                    && property_map(interfaces, "org.bluez.Device1").is_some()
+            })
+        {
+            return Err("Bluetoothデバイスが見つかりません".to_string());
+        }
+        Ok(())
+    }
+
+    fn connect_bluetooth(&self, device_path: &str) -> Result<(), String> {
+        self.bluetooth_device_exists(device_path)?;
+        let connection = self.system_bus.as_ref().ok_or("system bus unavailable")?;
+        Proxy::new(connection, "org.bluez", device_path, "org.bluez.Device1")
+            .map_err(|error| error.to_string())?
+            .call::<_, _, ()>("Connect", &())
+            .map_err(|error| error.to_string())
+    }
+
+    fn disconnect_bluetooth(&self, device_path: &str) -> Result<(), String> {
+        self.bluetooth_device_exists(device_path)?;
+        let connection = self.system_bus.as_ref().ok_or("system bus unavailable")?;
+        Proxy::new(connection, "org.bluez", device_path, "org.bluez.Device1")
+            .map_err(|error| error.to_string())?
+            .call::<_, _, ()>("Disconnect", &())
+            .map_err(|error| error.to_string())
+    }
+
+    fn pair_bluetooth(&self, device_path: &str) -> Result<(), String> {
+        self.bluetooth_device_exists(device_path)?;
+        let pairing = self
+            .bluetooth_pairing
+            .as_ref()
+            .ok_or("Bluetoothペアリングエージェントを開始できません")?;
+        pairing.pair_and_connect(device_path)
     }
 
     fn set_brightness(&self, percent: u8) -> Result<(), String> {
@@ -1650,6 +2000,172 @@ impl SystemBackend {
     }
 }
 
+impl Drop for SystemBackend {
+    fn drop(&mut self) {
+        self.stop_bluetooth_discovery();
+    }
+}
+
+const BLUETOOTH_PAIRING_AGENT_PATH: &str = "/org/bah/BluetoothAgent";
+
+struct BluetoothPairingClient {
+    connection: Connection,
+}
+
+impl BluetoothPairingClient {
+    fn new(
+        events: Sender<BluetoothEvent>,
+        responses: Receiver<BluetoothPairingResponse>,
+    ) -> Result<Self, String> {
+        let connection = Connection::system().map_err(|error| error.to_string())?;
+        connection
+            .object_server()
+            .at(
+                BLUETOOTH_PAIRING_AGENT_PATH,
+                BluetoothPairingAgent { events, responses },
+            )
+            .map_err(|error| error.to_string())?;
+        let manager = Proxy::new(
+            &connection,
+            "org.bluez",
+            "/org/bluez",
+            "org.bluez.AgentManager1",
+        )
+        .map_err(|error| error.to_string())?;
+        let path = OwnedObjectPath::try_from(BLUETOOTH_PAIRING_AGENT_PATH)
+            .map_err(|error| error.to_string())?;
+        manager
+            .call::<_, _, ()>("RegisterAgent", &(path, "KeyboardDisplay"))
+            .map_err(|error| error.to_string())?;
+        Ok(Self { connection })
+    }
+
+    fn pair_and_connect(&self, device_path: &str) -> Result<(), String> {
+        let device = Proxy::new(
+            &self.connection,
+            "org.bluez",
+            device_path,
+            "org.bluez.Device1",
+        )
+        .map_err(|error| error.to_string())?;
+        device
+            .call::<_, _, ()>("Pair", &())
+            .map_err(|error| error.to_string())?;
+        device
+            .set_property("Trusted", true)
+            .map_err(|error| error.to_string())?;
+        device
+            .call::<_, _, ()>("Connect", &())
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct BluetoothPairingAgent {
+    events: Sender<BluetoothEvent>,
+    responses: Receiver<BluetoothPairingResponse>,
+}
+
+impl BluetoothPairingAgent {
+    fn show(&self, device: OwnedObjectPath, prompt: BluetoothPairingPrompt) {
+        let _ = self.events.send_blocking(BluetoothEvent::PairingPrompt {
+            device_path: device.as_str().to_string(),
+            prompt,
+        });
+    }
+
+    fn request(
+        &self,
+        device: OwnedObjectPath,
+        prompt: BluetoothPairingPrompt,
+    ) -> zbus::fdo::Result<BluetoothPairingResponse> {
+        let device_path = device.as_str().to_string();
+        self.show(device, prompt);
+        loop {
+            let response = self.responses.recv_blocking().map_err(|_| {
+                zbus::fdo::Error::Failed("Bluetooth pairing was cancelled".to_string())
+            })?;
+            match &response {
+                BluetoothPairingResponse::PinCode {
+                    device_path: path, ..
+                }
+                | BluetoothPairingResponse::Confirm {
+                    device_path: path, ..
+                }
+                | BluetoothPairingResponse::Cancel { device_path: path }
+                    if path == &device_path =>
+                {
+                    return Ok(response);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn confirmation(
+        &self,
+        device: OwnedObjectPath,
+        prompt: BluetoothPairingPrompt,
+    ) -> zbus::fdo::Result<()> {
+        match self.request(device, prompt)? {
+            BluetoothPairingResponse::Confirm { accepted: true, .. } => Ok(()),
+            _ => Err(zbus::fdo::Error::Failed(
+                "Bluetooth pairing was rejected".to_string(),
+            )),
+        }
+    }
+}
+
+#[zbus::interface(name = "org.bluez.Agent1")]
+impl BluetoothPairingAgent {
+    fn release(&self) {}
+
+    fn request_pin_code(&self, device: OwnedObjectPath) -> zbus::fdo::Result<String> {
+        match self.request(device, BluetoothPairingPrompt::PinCode)? {
+            BluetoothPairingResponse::PinCode { pin_code, .. } if !pin_code.is_empty() => {
+                Ok(pin_code)
+            }
+            _ => Err(zbus::fdo::Error::Failed(
+                "Bluetooth pairing was rejected".to_string(),
+            )),
+        }
+    }
+
+    fn display_pin_code(&self, device: OwnedObjectPath, pin_code: String) {
+        self.show(device, BluetoothPairingPrompt::DisplayPinCode { pin_code });
+    }
+
+    fn request_passkey(&self, device: OwnedObjectPath) -> zbus::fdo::Result<u32> {
+        match self.request(device, BluetoothPairingPrompt::Passkey)? {
+            BluetoothPairingResponse::PinCode { pin_code, .. } => {
+                pin_code.parse::<u32>().map_err(|_| {
+                    zbus::fdo::Error::Failed("Bluetooth passkey must be numeric".to_string())
+                })
+            }
+            _ => Err(zbus::fdo::Error::Failed(
+                "Bluetooth pairing was rejected".to_string(),
+            )),
+        }
+    }
+
+    fn display_passkey(&self, device: OwnedObjectPath, passkey: u32, _entered: u16) {
+        self.show(device, BluetoothPairingPrompt::DisplayPasskey { passkey });
+    }
+
+    fn request_confirmation(&self, device: OwnedObjectPath, passkey: u32) -> zbus::fdo::Result<()> {
+        self.confirmation(device, BluetoothPairingPrompt::Confirmation { passkey })
+    }
+
+    fn request_authorization(&self, device: OwnedObjectPath) -> zbus::fdo::Result<()> {
+        self.confirmation(device, BluetoothPairingPrompt::Authorization)
+    }
+
+    fn authorize_service(&self, device: OwnedObjectPath, _uuid: String) -> zbus::fdo::Result<()> {
+        self.confirmation(device, BluetoothPairingPrompt::Authorization)
+    }
+
+    fn cancel(&self) {}
+}
+
 fn property_map<'a>(
     interfaces: &'a std::collections::HashMap<
         zbus::names::OwnedInterfaceName,
@@ -1669,6 +2185,21 @@ fn owned_bool(value: Option<&OwnedValue>) -> Option<bool> {
 
 fn owned_string(value: Option<&OwnedValue>) -> Option<String> {
     value.and_then(|value| String::try_from(value.clone()).ok())
+}
+
+fn owned_i16(value: Option<&OwnedValue>) -> Option<i16> {
+    value.and_then(|value| i16::try_from(value.clone()).ok())
+}
+
+fn sort_bluetooth_devices(devices: &mut [BluetoothDevice]) {
+    devices.sort_by(|left, right| {
+        right
+            .connected
+            .cmp(&left.connected)
+            .then_with(|| right.paired.cmp(&left.paired))
+            .then_with(|| right.rssi.cmp(&left.rssi))
+            .then_with(|| left.label.cmp(&right.label))
+    });
 }
 
 fn bluetooth_label(enabled: bool, connected_names: &[String]) -> String {
@@ -2091,12 +2622,12 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ActiveNetwork, AudioEndpoint, CpuCoreKind, CpuCoreUsage, CpuStatus, CpuTimes,
-        CpuUsageSampler, IpSettings, LevelStatus, MemoryStatus, NetworkKind, NetworkRoute,
-        NetworkSettings, WifiNetwork, WifiSecurity, bluetooth_label, classify_cpu_core_kinds,
-        cpu_list_count, parse_cpu_snapshot, parse_cpu_times, parse_memory_usage,
-        parse_wpctl_volume, preferred_network_route, sort_wifi_networks, validate_ip_settings,
-        wifi_security,
+        ActiveNetwork, AudioEndpoint, BluetoothDevice, CpuCoreKind, CpuCoreUsage, CpuStatus,
+        CpuTimes, CpuUsageSampler, IpSettings, LevelStatus, MemoryStatus, NetworkKind,
+        NetworkRoute, NetworkSettings, WifiNetwork, WifiSecurity, bluetooth_label,
+        classify_cpu_core_kinds, cpu_list_count, parse_cpu_snapshot, parse_cpu_times,
+        parse_memory_usage, parse_wpctl_volume, preferred_network_route, sort_bluetooth_devices,
+        sort_wifi_networks, validate_ip_settings, wifi_security,
     };
 
     #[test]
@@ -2222,6 +2753,52 @@ mod tests {
         assert_eq!(
             bluetooth_label(true, &["Headset".to_string(), "Keyboard".to_string()]),
             "2台接続"
+        );
+    }
+
+    #[test]
+    fn bluetooth_devices_sort_connected_then_paired_then_signal() {
+        let mut devices = vec![
+            BluetoothDevice {
+                path: "/org/bluez/hci0/dev_1".to_string(),
+                label: "Nearby".to_string(),
+                address: String::new(),
+                paired: false,
+                connected: false,
+                trusted: false,
+                rssi: Some(-30),
+                is_airpods: false,
+            },
+            BluetoothDevice {
+                path: "/org/bluez/hci0/dev_2".to_string(),
+                label: "Paired".to_string(),
+                address: String::new(),
+                paired: true,
+                connected: false,
+                trusted: true,
+                rssi: Some(-90),
+                is_airpods: false,
+            },
+            BluetoothDevice {
+                path: "/org/bluez/hci0/dev_3".to_string(),
+                label: "Connected".to_string(),
+                address: String::new(),
+                paired: true,
+                connected: true,
+                trusted: true,
+                rssi: None,
+                is_airpods: false,
+            },
+        ];
+
+        sort_bluetooth_devices(&mut devices);
+
+        assert_eq!(
+            devices
+                .into_iter()
+                .map(|device| device.label)
+                .collect::<Vec<_>>(),
+            vec!["Connected", "Paired", "Nearby"]
         );
     }
 

@@ -1,4 +1,5 @@
 use std::{
+    path::Path,
     process::Command,
     sync::MutexGuard,
     thread,
@@ -9,12 +10,15 @@ use async_channel::Sender;
 use chrono::{Datelike, Local, NaiveDate};
 use gpui::{
     Context, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, Window,
-    WindowHandle, div, ease_in_out, prelude::*, px, relative,
+    WindowHandle, div, ease_in_out, img, prelude::*, px, relative,
 };
 use log::warn;
 
 use crate::{
-    modules::notifications::{NotificationEvent, NotificationStore, SharedNotificationStore},
+    app::{DeviceControlCenterPage, DeviceControlCenterRoute},
+    modules::notifications::{
+        NotificationEvent, NotificationStore, SharedNotificationStore, emit_action_invoked,
+    },
     modules::system_controls::{
         AudioEndpoint, ControlAction, ControlSnapshot, LevelStatus, NetworkKind, ToggleStatus,
     },
@@ -30,6 +34,26 @@ const CONTROL_PADDING: f32 = 14.0;
 const CONTROL_GAP: f32 = 8.0;
 const CONTROL_ICON_BUTTON_WIDTH: f32 = 32.0;
 const SLIDER_SEND_INTERVAL: Duration = Duration::from_millis(50);
+
+fn notification_icon(path: &str, theme: BarTheme) -> gpui::AnyElement {
+    if Path::new(path).is_file() {
+        img(std::path::PathBuf::from(path))
+            .size(px(20.0))
+            .into_any_element()
+    } else {
+        div()
+            .size(px(20.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.0))
+            .bg(theme.border)
+            .text_size(px(11.0))
+            .child(if path.is_empty() { "" } else { "󰂚" })
+            .into_any_element()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SliderKind {
@@ -187,28 +211,28 @@ impl NotificationTray {
         cx.notify();
     }
 
-    fn launch_device_control_center(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn launch_device_control_center_network(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.hide(window, cx);
-        if let Err(error) = thread::Builder::new()
-            .name("bah-device-control-center-launch".to_string())
-            .spawn(|| {
-                let executable = match std::env::current_exe() {
-                    Ok(executable) => executable,
-                    Err(error) => {
-                        warn!("could not resolve current executable: {error}");
-                        return;
-                    }
-                };
-                if let Err(error) = Command::new(executable)
-                    .args(["window", "device-control-center"])
-                    .spawn()
-                {
-                    warn!("failed to launch device control center: {error}");
-                }
-            })
-        {
-            warn!("failed to start device control center launcher: {error}");
-        }
+        crate::app::request_device_control_center(DeviceControlCenterRoute {
+            page: DeviceControlCenterPage::Network,
+            ssid: None,
+        });
+    }
+
+    fn launch_device_control_center_bluetooth(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hide(window, cx);
+        crate::app::request_device_control_center(DeviceControlCenterRoute {
+            page: DeviceControlCenterPage::Bluetooth,
+            ssid: None,
+        });
     }
 
     fn launch_config_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -395,13 +419,18 @@ impl NotificationTray {
     }
 
     fn clear(&mut self, cx: &mut Context<Self>) {
-        let _ = self.updates.try_send(NotificationEvent::Clear);
+        let _ = self.updates.try_send(NotificationEvent::ClearAll);
         cx.notify();
     }
 
     fn dismiss(&mut self, id: u32, cx: &mut Context<Self>) {
-        let _ = self.updates.try_send(NotificationEvent::Close(id));
+        let _ = self.updates.try_send(NotificationEvent::Remove(id));
         cx.notify();
+    }
+
+    fn invoke_action(&mut self, id: u32, action: String, cx: &mut Context<Self>) {
+        emit_action_invoked(id, &action);
+        self.dismiss(id, cx);
     }
 
     fn show_previous_calendar_month(&mut self, cx: &mut Context<Self>) {
@@ -583,7 +612,7 @@ impl NotificationTray {
                     .cursor_pointer()
                     .hover(|style| style.bg(theme.active_background))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.launch_device_control_center(window, cx);
+                        this.launch_device_control_center_network(window, cx);
                     }))
                     .child(""),
             )
@@ -711,7 +740,7 @@ impl Render for NotificationTray {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(|this, _, window, cx| {
-                        this.launch_device_control_center(window, cx);
+                        this.launch_device_control_center_network(window, cx);
                         cx.stop_propagation();
                     }),
                 );
@@ -728,7 +757,7 @@ impl Render for NotificationTray {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(|this, _, window, cx| {
-                        this.launch_device_control_center(window, cx);
+                        this.launch_device_control_center_bluetooth(window, cx);
                         cx.stop_propagation();
                     }),
                 );
@@ -871,6 +900,7 @@ impl Render for NotificationTray {
                                 })
                                 .children(notifications.into_iter().map(|notification| {
                                     let id = notification.id;
+                                    let app_icon = notification.app_icon.clone();
                                     div()
                                         .id(("notification", id))
                                         .m(px(8.0))
@@ -880,8 +910,10 @@ impl Render for NotificationTray {
                                         .child(
                                             div()
                                                 .flex()
+                                                .items_center()
                                                 .justify_between()
                                                 .gap(px(8.0))
+                                                .child(notification_icon(&app_icon, theme))
                                                 .child(
                                                     div()
                                                         .flex_1()
@@ -921,6 +953,43 @@ impl Render for NotificationTray {
                                                     .text_size(px(11.0))
                                                     .text_color(theme.foreground)
                                                     .child(notification.body),
+                                            )
+                                        })
+                                        .when(!notification.actions.is_empty(), |item| {
+                                            item.child(
+                                                div()
+                                                    .mt(px(8.0))
+                                                    .flex()
+                                                    .flex_wrap()
+                                                    .gap(px(5.0))
+                                                    .children(notification.actions.into_iter().map(
+                                                        |action| {
+                                                            let action_key = action.key.clone();
+                                                            div()
+                                                                .id(format!(
+                                                                    "tray-notification-action-{id}-{action_key}"
+                                                                ))
+                                                                .px(px(7.0))
+                                                                .py(px(4.0))
+                                                                .rounded(px(5.0))
+                                                                .text_size(px(10.0))
+                                                                .cursor_pointer()
+                                                                .bg(theme.border)
+                                                                .hover(|style| {
+                                                                    style.bg(theme.foreground.alpha(0.2))
+                                                                })
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.invoke_action(
+                                                                            id,
+                                                                            action_key.clone(),
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                ))
+                                                                .child(action.label)
+                                                        },
+                                                    )),
                                             )
                                         })
                                 })),

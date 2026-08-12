@@ -20,12 +20,12 @@ pub struct Wallpaper {
     source: PathBuf,
     // The flock is tied to this descriptor and prevents duplicate wallpaper
     // clients for the lifetime of the Entity.
-    _lock: File,
+    _lock: Arc<File>,
     video_frame: Option<Arc<Mutex<Option<Arc<RenderImage>>>>>,
 }
 
 impl Wallpaper {
-    pub fn new(source: PathBuf, lock: File, cx: &mut Context<Self>) -> Self {
+    pub fn new(source: PathBuf, lock: Arc<File>, cx: &mut Context<Self>) -> Self {
         let mut wallpaper = Self {
             source,
             _lock: lock,

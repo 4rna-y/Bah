@@ -11,6 +11,7 @@ use log::debug;
 use serde::Deserialize;
 
 use super::{
+    display::{DisplayLayout, Monitor},
     icons::AppIconResolver,
     jump_list::JumpListAction,
     types::{ActiveWindow, ActiveWorkspace, Workspace, WorkspaceSnapshot, WorkspaceWindow},
@@ -109,6 +110,20 @@ impl HyprlandClient {
             active_window_icon,
             jump_list_actions,
         })
+    }
+
+    pub fn display_layout(&self) -> Result<DisplayLayout> {
+        let monitors: Vec<Monitor> = serde_json::from_str(&self.command("j/monitors")?)
+            .context("Hyprland returned invalid monitor JSON")?;
+        Ok(DisplayLayout::from_monitors(monitors))
+    }
+
+    pub fn reload(&self) -> Result<()> {
+        let response = self.command("reload")?;
+        if response.trim() != "ok" {
+            bail!("Hyprland rejected reload: {}", response.trim());
+        }
+        Ok(())
     }
 
     pub fn event_reader(&self) -> Result<BufReader<UnixStream>> {
