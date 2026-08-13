@@ -10,7 +10,7 @@ use async_channel::Sender;
 use chrono::{Datelike, Local, NaiveDate};
 use gpui::{
     Context, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, Window,
-    WindowHandle, div, ease_in_out, img, prelude::*, px, relative,
+    WindowHandle, div, img, prelude::*, px, relative,
 };
 use log::warn;
 
@@ -22,7 +22,7 @@ use crate::{
     modules::system_controls::{
         AudioEndpoint, ControlAction, ControlSnapshot, LevelStatus, NetworkKind, ToggleStatus,
     },
-    theme::{BarTheme, ui_font},
+    theme::{BarTheme, SurfaceRole, ui_font},
 };
 
 const CALENDAR_HEIGHT_RATIO: f32 = 0.35;
@@ -391,7 +391,9 @@ impl NotificationTray {
         let progress = (started_at.elapsed().as_secs_f32()
             / self.theme.notification_tray_slide_duration.as_secs_f32())
         .min(1.0);
-        let eased_progress = ease_in_out(progress);
+        // A short ease-out makes the tray feel attached to the screen edge:
+        // it enters promptly, then settles without a spring or compositor animation.
+        let eased_progress = 1.0 - (1.0 - progress).powi(5);
         let offset = if self.hiding {
             eased_progress
         } else {
@@ -501,7 +503,7 @@ impl NotificationTray {
                             .rounded(px(6.0))
                             .bg(theme.foreground)
                             .border_1()
-                            .border_color(theme.background.alpha(1.0))
+                            .border_color(theme.dialog_background)
                             .when(dragging, |knob| {
                                 knob.child(
                                     div()
@@ -512,7 +514,7 @@ impl NotificationTray {
                                         .px(px(5.0))
                                         .py(px(3.0))
                                         .rounded(px(5.0))
-                                        .bg(theme.background.alpha(1.0))
+                                        .bg(theme.floating_background)
                                         .border_1()
                                         .border_color(theme.border)
                                         .text_center()
@@ -530,7 +532,7 @@ impl NotificationTray {
                         .left(relative(0.5))
                         .ml(px(-28.0))
                         .px(px(4.0))
-                        .bg(theme.background.alpha(0.9))
+                        .bg(theme.floating_background)
                         .text_size(px(9.0))
                         .text_color(theme.muted_foreground)
                         .child("利用不可"),
@@ -802,7 +804,7 @@ impl Render for NotificationTray {
                         .size_full()
                         .flex()
                         .flex_col()
-                        .bg(theme.background)
+                        .bg(theme.surface(SurfaceRole::Shell))
                         .border_l_1()
                         .border_color(theme.border.alpha(0.9))
                         .text_color(theme.foreground)

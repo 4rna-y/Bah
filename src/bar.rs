@@ -12,8 +12,8 @@ use log::{error, info, warn};
 use crate::{
     airpods_popover::{AirPodsPopover, window_size as airpods_popover_window_size},
     hyprland::{
-        IpcUpdate, JumpListAction, WorkspaceWindow, close_window, launch_jump_list_action,
-        switch_to_workspace,
+        IpcUpdate, JumpListAction, WorkspaceWindow, close_window, focus_window,
+        launch_jump_list_action, switch_to_workspace,
     },
     modules::{
         clock::Clock,
@@ -30,7 +30,8 @@ use crate::{
     network_popover::{NetworkPopover, window_size as network_popover_window_size},
     notification_popup::NotificationPopupStack,
     notification_tray::{NotificationTray, NotificationTrayDismissTarget, TRAY_PANEL_WIDTH_RATIO},
-    theme::{BarTheme, ui_font},
+    theme::{BarTheme, SurfaceRole, ui_font},
+    window_switcher::{SwitcherState, WindowSwitcher},
 };
 
 /// GPUI entity that owns bar-local state and redraw scheduling.
@@ -55,11 +56,14 @@ pub struct Bar {
     _device_control_center_route_server: crate::app::DeviceControlCenterRouteServer,
     pending_device_control_center_route: Option<crate::app::DeviceControlCenterRoute>,
     airpods_popover: Option<WindowHandle<AirPodsPopover>>,
+    window_switcher: Option<WindowHandle<WindowSwitcher>>,
+    _window_switcher_command_server: crate::app::WindowSwitcherCommandServer,
     airpods_icon_bounds: Rc<RefCell<Bounds<Pixels>>>,
     bluetooth_icon_bounds: Rc<RefCell<Bounds<Pixels>>>,
     network_icon_bounds: Rc<RefCell<Bounds<Pixels>>>,
     controls: ControlChannels,
     control_snapshot: ControlSnapshot,
+    bar_display_id: Option<gpui::DisplayId>,
 }
 
 const JUMP_MENU_ROW_HEIGHT: f32 = 28.0;
@@ -295,10 +299,10 @@ impl Render for StatusTooltip {
             .size_full()
             .px(px(STATUS_TOOLTIP_HORIZONTAL_PADDING))
             .py(px(STATUS_TOOLTIP_VERTICAL_PADDING))
-            .rounded(px(6.0))
+            .rounded(self.theme.control_radius)
             .border_1()
             .border_color(self.theme.border)
-            .bg(self.theme.background.alpha(1.0))
+            .bg(self.theme.surface(SurfaceRole::Floating))
             .text_color(self.theme.foreground)
             .font(ui_font())
             .text_size(px(STATUS_TOOLTIP_FONT_SIZE))
@@ -349,6 +353,8 @@ impl Bar {
         device_control_center_routes: Receiver<crate::app::DeviceControlCenterRoute>,
         device_control_center_route_server: crate::app::DeviceControlCenterRouteServer,
         device_control_center_anchor: WindowHandle<DeviceControlCenterAnchor>,
+        window_switcher_commands: Receiver<crate::app::SwitcherCommand>,
+        window_switcher_command_server: crate::app::WindowSwitcherCommandServer,
         theme: BarTheme,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -373,11 +379,14 @@ impl Bar {
             _device_control_center_route_server: device_control_center_route_server,
             pending_device_control_center_route: None,
             airpods_popover: None,
+            window_switcher: None,
+            _window_switcher_command_server: window_switcher_command_server,
             network_icon_bounds: Rc::new(RefCell::new(Bounds::default())),
             airpods_icon_bounds: Rc::new(RefCell::new(Bounds::default())),
             bluetooth_icon_bounds: Rc::new(RefCell::new(Bounds::default())),
             controls,
             control_snapshot: ControlSnapshot::default(),
+            bar_display_id: None,
         };
         Self::start_clock(cx);
         Self::start_ipc_updates(ipc_updates, cx);
@@ -387,7 +396,25 @@ impl Bar {
         Self::start_bluetooth_events(bar.controls.bluetooth_events.clone(), cx);
         Self::start_network_settings_events(bar.controls.network_settings_events.clone(), cx);
         Self::start_device_control_center_routes(device_control_center_routes, cx);
+        Self::start_window_switcher_commands(window_switcher_commands, cx);
         bar
+    }
+
+    fn start_window_switcher_commands(
+        commands: Receiver<crate::app::SwitcherCommand>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |bar, cx| {
+            while let Ok(command) = commands.recv().await {
+                if bar
+                    .update(cx, |bar, cx| bar.handle_switcher_command(command, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     fn start_device_control_center_routes(
@@ -630,6 +657,125 @@ impl Bar {
             IpcUpdate::WorkerStopped(message) => {
                 error!("Hyprland IPC worker stopped: {message}");
             }
+        }
+    }
+
+    fn handle_switcher_command(
+        &mut self,
+        command: crate::app::SwitcherCommand,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            crate::app::SwitcherCommand::Open => self.open_window_switcher(None, cx),
+            crate::app::SwitcherCommand::Cycle => self.open_window_switcher(Some(1), cx),
+            crate::app::SwitcherCommand::CycleReverse => self.open_window_switcher(Some(-1), cx),
+            crate::app::SwitcherCommand::SelectPrevious => self.cycle_window_switcher(-1, cx),
+            crate::app::SwitcherCommand::SelectNext => self.cycle_window_switcher(1, cx),
+            crate::app::SwitcherCommand::Commit => self.commit_window_switcher(cx),
+            crate::app::SwitcherCommand::Close => self.close_window_switcher(cx),
+            // The regular IPC worker continuously refreshes the cache. Keeping this command
+            // makes the CLI interface symmetric with Altab and useful for debugging.
+            crate::app::SwitcherCommand::Refresh => cx.notify(),
+        }
+    }
+
+    fn switcher_state(&self) -> Option<(SwitcherState, Option<String>)> {
+        let (windows, active_address, focused_monitor) = self.workspaces.as_ref()?.switcher_state();
+        Some((SwitcherState::new(windows, active_address), focused_monitor))
+    }
+
+    fn open_window_switcher(&mut self, initial_step: Option<isize>, cx: &mut Context<Self>) {
+        let Some((state, focused_monitor)) = self.switcher_state() else {
+            warn!("window switcher requested before Hyprland state was available");
+            return;
+        };
+        if state.windows.is_empty() {
+            return;
+        }
+
+        if let Some(switcher) = self.window_switcher {
+            let _ = switcher.update(cx, |switcher, window, cx| {
+                if !switcher.is_open() {
+                    switcher.open(state, window, cx);
+                }
+                if let Some(step) = initial_step {
+                    switcher.cycle(step, cx);
+                }
+            });
+            return;
+        }
+
+        let theme = self.theme;
+        // A switch belongs to the output that owned focus when the candidate
+        // list was frozen. Hyprland output names and GPUI displays share the
+        // deterministic UUID mapping used by the wallpaper layers.
+        let display_id = focused_monitor
+            .as_deref()
+            .and_then(|output| crate::app::display_id_for_output(cx, output))
+            .or(self.bar_display_id);
+        match cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                focus: false,
+                show: true,
+                is_movable: false,
+                is_resizable: false,
+                display_id,
+                app_id: Some("bah-window-switcher".to_string()),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_decorations: Some(WindowDecorations::Client),
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: Size::new(px(1.0), px(1.0)),
+                })),
+                kind: WindowKind::LayerShell(LayerShellOptions {
+                    namespace: "bah".to_string(),
+                    layer: Layer::Overlay,
+                    anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                    exclusive_zone: Some(px(0.0)),
+                    keyboard_interactivity: KeyboardInteractivity::None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|_| WindowSwitcher::new(theme)),
+        ) {
+            Ok(switcher) => {
+                let _ = switcher.update(cx, |switcher, window, cx| {
+                    switcher.open(state, window, cx);
+                    if let Some(step) = initial_step {
+                        switcher.cycle(step, cx);
+                    }
+                });
+                self.window_switcher = Some(switcher);
+                info!("window switcher surface opened");
+            }
+            Err(error) => error!("failed to create window switcher surface: {error}"),
+        }
+    }
+
+    fn cycle_window_switcher(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some(switcher) = self.window_switcher {
+            let _ = switcher.update(cx, |switcher, _, cx| switcher.cycle(step, cx));
+        }
+    }
+
+    fn close_window_switcher(&mut self, cx: &mut Context<Self>) {
+        if let Some(switcher) = self.window_switcher {
+            let _ = switcher.update(cx, |switcher, window, cx| switcher.close(window, cx));
+        }
+    }
+
+    fn commit_window_switcher(&mut self, cx: &mut Context<Self>) {
+        let address = self.window_switcher.and_then(|switcher| {
+            switcher
+                .read_with(cx, |switcher, _| switcher.selected_address())
+                .ok()
+                .flatten()
+        });
+        self.close_window_switcher(cx);
+        if let Some(address) = address {
+            focus_window(address);
         }
     }
 
@@ -1071,20 +1217,13 @@ impl Bar {
     fn show_device_control_center(
         &mut self,
         page: crate::app::DeviceControlCenterPage,
-        window: &mut Window,
-        cx: &mut Context<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) {
-        if let Some(center) = self.device_control_center {
-            if center.update(cx, |_, _, _| {}).is_ok() {
-                self.close_device_control_center(cx);
-                return;
-            }
-            self.device_control_center = None;
-        }
-        self.close_status_tooltip(cx);
-        self.close_network_popover(cx);
-        self.close_airpods_popover(cx);
-        self.open_device_control_center(page, None, window, cx);
+        crate::app::request_device_control_center(crate::app::DeviceControlCenterRoute {
+            page,
+            ssid: None,
+        });
     }
 
     fn open_device_control_center(
@@ -1097,6 +1236,7 @@ impl Bar {
         let route = crate::app::DeviceControlCenterRoute { page, ssid };
         let controls = self.controls.clone();
         let snapshot = self.control_snapshot.clone();
+        let theme = self.theme;
         let parent = self.device_control_center_anchor.into();
         let display_size = window
             .display(cx)
@@ -1140,7 +1280,7 @@ impl Bar {
             move |_, cx| {
                 cx.new(|cx| {
                     crate::device_control_center::DeviceControlCenter::new_popover(
-                        controls, snapshot, route, cx,
+                        controls, snapshot, route, theme, cx,
                     )
                 })
             },
@@ -1167,14 +1307,10 @@ impl Bar {
     fn show_device_control_center_route(
         &mut self,
         route: crate::app::DeviceControlCenterRoute,
-        window: &mut Window,
-        cx: &mut Context<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) {
-        self.close_device_control_center(cx);
-        self.close_status_tooltip(cx);
-        self.close_network_popover(cx);
-        self.close_airpods_popover(cx);
-        self.open_device_control_center(route.page, route.ssid, window, cx);
+        crate::app::request_device_control_center(route);
     }
 
     fn close_device_control_center(&mut self, cx: &mut Context<Self>) {
@@ -1273,6 +1409,7 @@ impl Bar {
 
 impl Render for Bar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.bar_display_id = window.display(cx).as_ref().map(|display| display.id());
         if let Some(route) = self.pending_device_control_center_route.take() {
             self.show_device_control_center_route(route, window, cx);
         }
@@ -1351,7 +1488,7 @@ impl Render for Bar {
                     .items_center()
                     .px(theme.horizontal_padding)
                     .gap(theme.module_spacing)
-                    .bg(theme.background)
+                    .bg(theme.surface(SurfaceRole::Shell))
                     .border_b_1()
                     .border_color(theme.border)
                     .text_color(theme.foreground)
@@ -1615,9 +1752,9 @@ impl Render for Bar {
                         .top(theme.bar_height)
                         .left(left)
                         .w(px(JUMP_MENU_WIDTH))
-                        .bg(theme.background)
+                        .bg(theme.surface(SurfaceRole::Floating))
                         .border_1()
-                        .border_color(theme.foreground.alpha(0.7))
+                        .border_color(theme.strong_border)
                         .rounded(theme.active_workspace_radius)
                         .text_color(theme.foreground)
                         .font(ui_font())
@@ -1649,9 +1786,9 @@ impl Render for Bar {
                         .top(theme.bar_height)
                         .left(left)
                         .w(px(JUMP_MENU_WIDTH))
-                        .bg(theme.background)
+                        .bg(theme.surface(SurfaceRole::Floating))
                         .border_1()
-                        .border_color(theme.foreground.alpha(0.7))
+                        .border_color(theme.strong_border)
                         .rounded(theme.active_workspace_radius)
                         .text_color(theme.foreground)
                         .font(ui_font())

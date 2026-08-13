@@ -9,3 +9,7 @@ Bah writes its application log to standard output and also appends it to
 Before diagnosing a Bah runtime issue, inspect the latest entries in this file
 with `tail -n 200 "$XDG_STATE_HOME/bah/bah.log"` (or the fallback path), then
 correlate them with the user-reported action and timestamp.
+
+## Terminate the existing Bah process
+
+To terminate the existing Bah process due to do a test or build, run `pkill -f bah`.

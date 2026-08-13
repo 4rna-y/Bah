@@ -46,6 +46,8 @@ pub(crate) struct ActiveWorkspace {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ActiveWindow {
     #[serde(default)]
+    pub address: String,
+    #[serde(default)]
     pub title: String,
     #[serde(default, rename = "class")]
     pub app_id: String,
@@ -54,10 +56,12 @@ pub(crate) struct ActiveWindow {
 }
 
 /// A single IPC refresh used by the workspace module.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct WorkspaceSnapshot {
     pub workspaces: Vec<Workspace>,
     pub workspace_windows: Vec<WorkspaceWindow>,
+    pub monitors: Vec<super::display::Monitor>,
+    pub active_window_address: Option<String>,
     pub active_window_title: Option<String>,
     pub active_window_icon: Option<PathBuf>,
     pub jump_list_actions: Vec<JumpListAction>,
@@ -73,6 +77,16 @@ pub struct WorkspaceWindow {
     pub initial_app_id: String,
     #[serde(default)]
     pub title: String,
+    #[serde(default, rename = "initialTitle")]
+    pub initial_title: String,
+    #[serde(default)]
+    pub mapped: bool,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default, rename = "focusHistoryID")]
+    pub focus_history_id: i64,
     pub workspace: WindowWorkspace,
     #[serde(skip)]
     pub display_name: String,
@@ -83,6 +97,19 @@ pub struct WorkspaceWindow {
 impl WorkspaceWindow {
     pub fn app_name(&self) -> &str {
         &self.display_name
+    }
+
+    /// Mirrors Altab's eligibility rule for normal, user-switchable windows.
+    pub fn is_switcher_candidate(&self) -> bool {
+        self.mapped && !self.hidden && !self.pinned && (1..=100).contains(&self.workspace.id)
+    }
+
+    pub fn title_or_initial(&self) -> &str {
+        if self.title.trim().is_empty() {
+            &self.initial_title
+        } else {
+            &self.title
+        }
     }
 }
 

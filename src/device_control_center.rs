@@ -8,7 +8,7 @@ use std::{
 
 use gpui::{
     Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Render, Window, div, img, prelude::*, px, rgb, rgba,
+    Render, Window, div, img, prelude::*, px, rgba,
 };
 use log::error;
 
@@ -22,7 +22,7 @@ use crate::{
         BluetoothPairingResponse, ControlAction, ControlChannels, ControlSnapshot, IpSettings,
         NetworkSettings, NetworkSettingsEvent, WifiConnectionEvent, WifiNetwork, WifiSecurity,
     },
-    theme::ui_font,
+    theme::{BarTheme, SurfaceRole, ui_font},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -182,6 +182,7 @@ pub struct DeviceControlCenter {
     display_drag: Option<MonitorDrag>,
     display_message: Option<String>,
     display_applying: bool,
+    theme: BarTheme,
 }
 
 impl DeviceControlCenter {
@@ -189,6 +190,7 @@ impl DeviceControlCenter {
         controls: ControlChannels,
         snapshot: ControlSnapshot,
         route: DeviceControlCenterRoute,
+        theme: BarTheme,
         cx: &mut Context<Self>,
     ) -> Self {
         let _ = controls.actions.try_send(ControlAction::SetWifiDiscovery(
@@ -222,6 +224,7 @@ impl DeviceControlCenter {
             display_drag: None,
             display_message: None,
             display_applying: false,
+            theme,
         }
     }
 
@@ -935,6 +938,7 @@ impl DeviceControlCenter {
         disabled: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let theme = self.theme;
         let focused = self.active_input == Some(field);
         let value = self.input_value(field);
         div()
@@ -944,7 +948,7 @@ impl DeviceControlCenter {
             .child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(rgb(0xaeb1bd))
+                    .text_color(theme.muted_foreground)
                     .child(label),
             )
             .child(
@@ -952,13 +956,9 @@ impl DeviceControlCenter {
                     .id(("dcc-network-input", field.element_id()))
                     .h(px(34.0))
                     .px(px(9.0))
-                    .rounded(px(5.0))
+                    .rounded(theme.control_radius)
                     .border_1()
-                    .border_color(if focused {
-                        rgb(0x7da7ff)
-                    } else {
-                        rgb(0x444752)
-                    })
+                    .border_color(if focused { theme.focus } else { theme.border })
                     .opacity(if disabled { 0.45 } else { 1.0 })
                     .cursor_pointer()
                     .flex()
@@ -982,12 +982,13 @@ impl DeviceControlCenter {
         ipv6: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let theme = self.theme;
         let automatic = settings.automatic;
         let manual = !automatic;
         div()
             .p(px(12.0))
-            .rounded(px(7.0))
-            .bg(rgb(0x272932))
+            .rounded(theme.panel_radius)
+            .bg(theme.container_background)
             .flex()
             .flex_col()
             .gap(px(10.0))
@@ -1005,7 +1006,7 @@ impl DeviceControlCenter {
                             .child(
                                 div()
                                     .text_size(px(12.0))
-                                    .text_color(rgb(0xaeb1bd))
+                                    .text_color(theme.muted_foreground)
                                     .child("手動設定"),
                             )
                             .child(
@@ -1016,8 +1017,12 @@ impl DeviceControlCenter {
                                     .p(px(3.0))
                                     .rounded(px(12.0))
                                     .cursor_pointer()
-                                    .bg(if manual { rgb(0x315b46) } else { rgb(0x444752) })
-                                    .hover(|style| style.bg(rgb(0x526577)))
+                                    .bg(if manual {
+                                        theme.active_background
+                                    } else {
+                                        theme.border
+                                    })
+                                    .hover(|style| style.bg(theme.hover_background))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.set_manual(ipv6, !manual, cx)
                                     }))
@@ -1025,7 +1030,7 @@ impl DeviceControlCenter {
                                         div()
                                             .size(px(18.0))
                                             .rounded_full()
-                                            .bg(rgb(0xf5f5f7))
+                                            .bg(theme.foreground)
                                             .when(manual, |knob| knob.ml_auto()),
                                     ),
                             ),
@@ -1094,8 +1099,9 @@ impl Render for DeviceControlCenter {
             self.activate_requested = false;
             window.activate_window();
         }
-        let muted = rgb(0xaeb1bd);
-        let panel = rgb(0x202128);
+        let theme = self.theme;
+        let muted = theme.muted_foreground;
+        let panel = theme.container_background;
         let page = self.page;
         let wifi_enabled = self.snapshot.wifi.enabled;
         let networks = self.snapshot.wifi_networks.clone();
@@ -1118,8 +1124,8 @@ impl Render for DeviceControlCenter {
         div()
             .size_full()
             .relative()
-            .bg(rgb(0x17181e))
-            .text_color(rgb(0xf5f5f7))
+            .bg(theme.surface(SurfaceRole::Dialog))
+            .text_color(theme.foreground)
             .font(ui_font())
             .child(
                 div()
@@ -1133,7 +1139,7 @@ impl Render for DeviceControlCenter {
                             .flex()
                             .flex_col()
                             .border_r_1()
-                            .border_color(rgb(0x343640))
+                            .border_color(theme.border)
                             .gap(px(6.0))
                             .child(
                                 div()
@@ -1145,11 +1151,11 @@ impl Render for DeviceControlCenter {
                                     .items_center()
                                     .cursor_pointer()
                                     .bg(if page == DeviceControlCenterPage::Network {
-                                        rgb(0x343640)
+                                        theme.active_background
                                     } else {
-                                        rgb(0x202128)
+                                        theme.container_background
                                     })
-                                    .hover(|style| style.bg(rgb(0x343640)))
+                                    .hover(|style| style.bg(theme.hover_background))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_page(DeviceControlCenterPage::Network);
                                         cx.notify();
@@ -1166,11 +1172,11 @@ impl Render for DeviceControlCenter {
                                     .items_center()
                                     .cursor_pointer()
                                     .bg(if page == DeviceControlCenterPage::Bluetooth {
-                                        rgb(0x343640)
+                                        theme.active_background
                                     } else {
-                                        rgb(0x202128)
+                                        theme.container_background
                                     })
-                                    .hover(|style| style.bg(rgb(0x343640)))
+                                    .hover(|style| style.bg(theme.hover_background))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_page(DeviceControlCenterPage::Bluetooth);
                                         cx.notify();
@@ -1187,11 +1193,11 @@ impl Render for DeviceControlCenter {
                                     .items_center()
                                     .cursor_pointer()
                                     .bg(if page == DeviceControlCenterPage::Display {
-                                        rgb(0x343640)
+                                        theme.active_background
                                     } else {
-                                        rgb(0x202128)
+                                        theme.container_background
                                     })
-                                    .hover(|style| style.bg(rgb(0x343640)))
+                                    .hover(|style| style.bg(theme.hover_background))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_page(DeviceControlCenterPage::Display);
                                         cx.notify();
@@ -1229,14 +1235,14 @@ impl Render for DeviceControlCenter {
                                             .p(px(3.0))
                                             .rounded(px(14.0))
                                             .cursor_pointer()
-                                            .bg(if wifi_enabled { rgb(0x315b46) } else { rgb(0x444752) })
-                                            .hover(|style| style.bg(rgb(0x526577)))
+                                            .bg(if wifi_enabled { theme.active_background } else { theme.border })
+                                            .hover(|style| style.bg(theme.hover_background))
                                             .on_click(cx.listener(|this, _, _, cx| this.toggle_wifi(cx)))
                                             .child(
                                                 div()
                                                     .size(px(22.0))
                                                     .rounded_full()
-                                                    .bg(rgb(0xf5f5f7))
+                                                    .bg(theme.foreground)
                                                     .when(wifi_enabled, |knob| knob.ml_auto()),
                                             ),
                                     ),
@@ -1284,12 +1290,12 @@ impl Render for DeviceControlCenter {
                                                             .flex()
                                                             .items_center()
                                                             .gap(px(8.0))
-                                                            .bg(rgb(0x343640))
+                                                            .bg(theme.active_background)
                                                             .child(div().flex_1().child(network.label))
                                                             .when_some(route_badge, |row, badge| {
                                                                 row.child(
                                                                     div()
-                                                                        .text_color(rgb(0x63d297))
+                                                                        .text_color(theme.success)
                                                                         .text_size(px(12.0))
                                                                         .child(badge),
                                                                 )
@@ -1304,7 +1310,7 @@ impl Render for DeviceControlCenter {
                                                                     .items_center()
                                                                     .justify_center()
                                                                     .cursor_pointer()
-                                                                    .hover(|style| style.bg(rgb(0x526577)))
+                                                                    .hover(|style| style.bg(theme.hover_background))
                                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                                         this.open_details(network_for_details.clone(), cx)
                                                                     }))
@@ -1322,8 +1328,8 @@ impl Render for DeviceControlCenter {
                                                             .flex()
                                                             .items_center()
                                                             .cursor_pointer()
-                                                            .bg(if is_selected { rgb(0x343640) } else { panel })
-                                                            .hover(|style| style.bg(rgb(0x343640)))
+                                                            .bg(if is_selected { theme.active_background } else { panel })
+                                                            .hover(|style| style.bg(theme.hover_background))
                                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                                 this.select_network(network_for_click.clone(), cx)
                                                             }))
@@ -1364,8 +1370,8 @@ impl Render for DeviceControlCenter {
                                                             .flex()
                                                             .items_center()
                                                             .cursor_pointer()
-                                                            .bg(if is_selected { rgb(0x343640) } else { panel })
-                                                            .hover(|style| style.bg(rgb(0x343640)))
+                                                            .bg(if is_selected { theme.active_background } else { panel })
+                                                            .hover(|style| style.bg(theme.hover_background))
                                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                                 this.select_network(network_for_click.clone(), cx)
                                                             }))
@@ -1416,18 +1422,19 @@ impl Render for DeviceControlCenter {
 
 impl DeviceControlCenter {
     fn render_display_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let panel = rgb(0x202128);
-        let muted = rgb(0xaeb1bd);
+        let theme = self.theme;
+        let panel = theme.container_background;
+        let muted = theme.muted_foreground;
         let selected_name = self.display_selected.clone();
         let Some(layout) = self.display_layout.clone() else {
             return div()
                 .size_full()
                 .p(px(28.0))
-                .bg(rgb(0x17181e))
-                .text_color(rgb(0xf5f5f7))
+                .bg(theme.dialog_background)
+                .text_color(theme.foreground)
                 .font(ui_font())
                 .child(div().text_size(px(24.0)).child("ディスプレイ"))
-                .child(div().mt(px(16.0)).text_color(rgb(0xffa6a6)).child(
+                .child(div().mt(px(16.0)).text_color(theme.error).child(
                     self.display_message.clone().unwrap_or_else(|| {
                         "モニター情報を取得できません。Hyprland上で実行してください。".into()
                     }),
@@ -1468,10 +1475,10 @@ impl DeviceControlCenter {
             .relative()
             .h(px(282.0))
             .w_full()
-            .rounded(px(8.0))
-            .bg(rgb(0x15161b))
+            .rounded(theme.panel_radius)
+            .bg(theme.window_background)
             .border_1()
-            .border_color(rgb(0x343640))
+            .border_color(theme.border)
             .overflow_hidden()
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 this.move_monitor_drag(event, cx);
@@ -1497,15 +1504,19 @@ impl DeviceControlCenter {
                     .w(px(panel_width))
                     .h(px(panel_height))
                     .p(px(6.0))
-                    .rounded(px(5.0))
+                    .rounded(theme.control_radius)
                     .cursor_pointer()
                     .bg(if selected {
-                        rgb(0x526577)
+                        theme.active_background
                     } else {
-                        rgb(0x343640)
+                        theme.container_background
                     })
                     .border_1()
-                    .border_color(if main { rgb(0x63d297) } else { rgb(0x777b8c) })
+                    .border_color(if main {
+                        theme.success
+                    } else {
+                        theme.strong_border
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event, _, cx| {
@@ -1548,8 +1559,8 @@ impl DeviceControlCenter {
         div()
             .size_full()
             .p(px(28.0))
-            .bg(rgb(0x17181e))
-            .text_color(rgb(0xf5f5f7))
+            .bg(theme.dialog_background)
+            .text_color(theme.foreground)
             .font(ui_font())
             .flex()
             .flex_col()
@@ -1565,10 +1576,10 @@ impl DeviceControlCenter {
                             .id("dcc-display-refresh")
                             .px(px(10.0))
                             .py(px(6.0))
-                            .rounded(px(5.0))
+                            .rounded(theme.control_radius)
                             .cursor_pointer()
                             .bg(panel)
-                            .hover(|style| style.bg(rgb(0x343640)))
+                            .hover(|style| style.bg(theme.hover_background))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.refresh_display_state();
                                 cx.notify();
@@ -1588,7 +1599,7 @@ impl DeviceControlCenter {
                 page.child(
                     div()
                         .p(px(14.0))
-                        .rounded(px(8.0))
+                        .rounded(theme.panel_radius)
                         .bg(panel)
                         .flex()
                         .flex_col()
@@ -1624,14 +1635,14 @@ impl DeviceControlCenter {
                                         .rounded(px(3.0))
                                         .border_1()
                                         .border_color(if selected_is_main {
-                                            rgb(0x63d297)
+                                            theme.success
                                         } else {
-                                            rgb(0x777b8c)
+                                            theme.strong_border
                                         })
                                         .bg(if selected_is_main {
-                                            rgb(0x315b46)
+                                            theme.active_background
                                         } else {
-                                            rgb(0x17181e)
+                                            theme.window_background
                                         })
                                         .text_center()
                                         .text_size(px(12.0))
@@ -1659,8 +1670,8 @@ impl DeviceControlCenter {
                                         .py(px(5.0))
                                         .rounded(px(4.0))
                                         .cursor_pointer()
-                                        .bg(rgb(0x343640))
-                                        .hover(|style| style.bg(rgb(0x526577)))
+                                        .bg(theme.container_background)
+                                        .hover(|style| style.bg(theme.hover_background))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.choose_wallpaper(window, cx);
                                         }))
@@ -1673,8 +1684,8 @@ impl DeviceControlCenter {
                                         .py(px(5.0))
                                         .rounded(px(4.0))
                                         .cursor_pointer()
-                                        .bg(rgb(0x343640))
-                                        .hover(|style| style.bg(rgb(0x526577)))
+                                        .bg(theme.container_background)
+                                        .hover(|style| style.bg(theme.hover_background))
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.clear_wallpaper(cx)),
                                         )
@@ -1687,7 +1698,7 @@ impl DeviceControlCenter {
                 page.child(
                     div()
                         .text_size(px(12.0))
-                        .text_color(rgb(0xffa6a6))
+                        .text_color(theme.error)
                         .child(message),
                 )
             })
@@ -1695,7 +1706,7 @@ impl DeviceControlCenter {
                 page.child(
                     div()
                         .text_size(px(12.0))
-                        .text_color(rgb(0xaeb1bd))
+                        .text_color(theme.muted_foreground)
                         .child(message),
                 )
             })
@@ -1706,15 +1717,15 @@ impl DeviceControlCenter {
                         .id("dcc-display-apply")
                         .px(px(16.0))
                         .py(px(8.0))
-                        .rounded(px(5.0))
+                        .rounded(theme.control_radius)
                         .cursor_pointer()
                         .opacity(if layout.overlaps() || self.display_applying {
                             0.45
                         } else {
                             1.0
                         })
-                        .bg(rgb(0x315b46))
-                        .hover(|style| style.bg(rgb(0x3b7357)))
+                        .bg(theme.active_background)
+                        .hover(|style| style.bg(theme.pressed_background))
                         .on_click(cx.listener(|this, _, _, cx| this.apply_display_changes(cx)))
                         .child(if self.display_applying {
                             "適用中…"
@@ -1726,8 +1737,9 @@ impl DeviceControlCenter {
     }
 
     fn render_airpods_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let panel = rgb(0x2a2c35);
-        let muted = rgb(0xaeb1bd);
+        let theme = self.theme;
+        let panel = theme.container_background;
+        let muted = theme.muted_foreground;
         let selected = self.snapshot.airpods.listening_mode;
         let ready = self.snapshot.airpods.ready;
         let pod = |label: &'static str, path: &'static str, percent: Option<u8>| {
@@ -1753,13 +1765,13 @@ impl DeviceControlCenter {
                         .my(px(4.0))
                         .h(px(5.0))
                         .rounded_full()
-                        .bg(rgb(0x454853))
+                        .bg(theme.border)
                         .child(
                             div()
                                 .h_full()
                                 .w(gpui::relative(percent.unwrap_or(0).min(100) as f32 / 100.0))
                                 .rounded_full()
-                                .bg(rgb(0x63d297)),
+                                .bg(theme.success),
                         ),
                 )
         };
@@ -1780,22 +1792,22 @@ impl DeviceControlCenter {
                         .id(format!("dcc-airpods-mode-{id}"))
                         .w_full()
                         .h(px(34.0))
-                        .rounded(px(6.0))
+                        .rounded(theme.control_radius)
                         .border_1()
-                        .border_color(rgb(0x454853))
+                        .border_color(theme.border)
                         .flex()
                         .items_center()
                         .justify_center()
                         .text_size(px(22.0))
-                        .text_color(if is_selected { rgb(0xf5f5f7) } else { muted })
+                        .text_color(if is_selected { theme.foreground } else { muted })
                         .bg(if is_selected {
-                            rgb(0x343640)
+                            theme.active_background
                         } else {
-                            rgb(0x202128)
+                            theme.container_background
                         })
                         .opacity(if ready { 1.0 } else { 0.45 })
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgb(0x343640)))
+                        .hover(|style| style.bg(theme.hover_background))
                         .on_click(
                             cx.listener(move |this, _, _, cx| this.set_airpods_mode(candidate, cx)),
                         )
@@ -1805,14 +1817,14 @@ impl DeviceControlCenter {
                     div()
                         .h(px(16.0))
                         .text_size(px(8.0))
-                        .text_color(if is_selected { rgb(0xf5f5f7) } else { muted })
+                        .text_color(if is_selected { theme.foreground } else { muted })
                         .child(label),
                 )
         };
 
         div()
             .p(px(12.0))
-            .rounded(px(7.0))
+            .rounded(theme.panel_radius)
             .bg(panel)
             .flex()
             .flex_col()
@@ -1861,7 +1873,7 @@ impl DeviceControlCenter {
                 card.child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(0xffa6a6))
+                        .text_color(theme.error)
                         .child(message),
                 )
             })
@@ -1876,8 +1888,9 @@ impl DeviceControlCenter {
     }
 
     fn render_bluetooth_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let panel = rgb(0x202128);
-        let muted = rgb(0xaeb1bd);
+        let theme = self.theme;
+        let panel = theme.container_background;
+        let muted = theme.muted_foreground;
         let enabled = self.snapshot.bluetooth.enabled;
         let available = self.snapshot.bluetooth.available;
         let devices = self.snapshot.bluetooth_devices.clone();
@@ -1928,18 +1941,18 @@ impl DeviceControlCenter {
                 .min_h(px(52.0))
                 .px(px(10.0))
                 .py(px(6.0))
-                .rounded(px(5.0))
+                .rounded(theme.control_radius)
                 .flex()
                 .items_center()
                 .gap(px(8.0))
                 .cursor_pointer()
                 .opacity(if operation.is_some() { 0.55 } else { 1.0 })
                 .bg(if device.connected {
-                    rgb(0x343640)
+                    theme.active_background
                 } else {
                     panel
                 })
-                .hover(|style| style.bg(rgb(0x343640)))
+                .hover(|style| style.bg(theme.hover_background))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select_bluetooth_device(click_device.clone(), cx)
                 }))
@@ -1962,7 +1975,7 @@ impl DeviceControlCenter {
         div()
             .size_full()
             .p(px(28.0))
-            .bg(rgb(0x17181e))
+            .bg(theme.dialog_background)
             .flex()
             .flex_col()
             .gap(px(16.0))
@@ -1982,23 +1995,23 @@ impl DeviceControlCenter {
                             .cursor_pointer()
                             .opacity(if available { 1.0 } else { 0.45 })
                             .bg(if enabled {
-                                rgb(0x315b46)
+                                theme.active_background
                             } else {
-                                rgb(0x444752)
+                                theme.border
                             })
-                            .hover(|style| style.bg(rgb(0x526577)))
+                            .hover(|style| style.bg(theme.hover_background))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_bluetooth(cx)))
                             .child(
                                 div()
                                     .size(px(22.0))
                                     .rounded_full()
-                                    .bg(rgb(0xf5f5f7))
+                                    .bg(theme.foreground)
                                     .when(enabled, |knob| knob.ml_auto()),
                             ),
                     ),
             )
             .when_some(self.bluetooth_message.clone(), |page, message| {
-                page.child(div().text_color(rgb(0xffa6a6)).child(message))
+                page.child(div().text_color(theme.error).child(message))
             })
             .when(!available, |page| {
                 page.child(div().text_color(muted).child("Bluetoothは利用できません"))
@@ -2025,7 +2038,7 @@ impl DeviceControlCenter {
                                 })
                                 .min_h(px(0.0))
                                 .p(px(12.0))
-                                .rounded(px(7.0))
+                                .rounded(theme.panel_radius)
                                 .bg(panel)
                                 .flex()
                                 .flex_col()
@@ -2062,7 +2075,7 @@ impl DeviceControlCenter {
                                 .flex_1()
                                 .min_h(px(0.0))
                                 .p(px(12.0))
-                                .rounded(px(7.0))
+                                .rounded(theme.panel_radius)
                                 .bg(panel)
                                 .flex()
                                 .flex_col()
@@ -2102,6 +2115,7 @@ impl DeviceControlCenter {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let theme = self.theme;
         let requires_input = matches!(
             &dialog.prompt,
             BluetoothPairingPrompt::PinCode | BluetoothPairingPrompt::Passkey
@@ -2147,8 +2161,8 @@ impl DeviceControlCenter {
                     .id("dcc-bluetooth-pairing-modal")
                     .w(px(440.0))
                     .p(px(20.0))
-                    .rounded(px(8.0))
-                    .bg(rgb(0x282a33))
+                    .rounded(theme.panel_radius)
+                    .bg(theme.dialog_background)
                     .track_focus(&self.input_focus)
                     .on_key_down(
                         cx.listener(|this, event, window, cx| {
@@ -2159,7 +2173,11 @@ impl DeviceControlCenter {
                     .flex_col()
                     .gap(px(14.0))
                     .child(div().text_size(px(20.0)).child("Bluetooth ペアリング"))
-                    .child(div().text_color(rgb(0xaeb1bd)).child(dialog.device_label))
+                    .child(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child(dialog.device_label),
+                    )
                     .child(instruction)
                     .when(requires_input, |modal| {
                         modal.child(
@@ -2167,8 +2185,8 @@ impl DeviceControlCenter {
                                 .id("dcc-bluetooth-pairing-input")
                                 .h(px(36.0))
                                 .px(px(10.0))
-                                .rounded(px(5.0))
-                                .bg(rgb(0x17181e))
+                                .rounded(theme.control_radius)
+                                .bg(theme.window_background)
                                 .cursor_text()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.focus_input(InputField::BluetoothPin, window, cx)
@@ -2193,9 +2211,9 @@ impl DeviceControlCenter {
                                             .id("dcc-bluetooth-pairing-cancel")
                                             .h(px(34.0))
                                             .px(px(12.0))
-                                            .rounded(px(5.0))
+                                            .rounded(theme.control_radius)
                                             .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0x3b3e48)))
+                                            .hover(|style| style.bg(theme.hover_background))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.respond_bluetooth_pairing(false, cx)
                                             }))
@@ -2208,9 +2226,9 @@ impl DeviceControlCenter {
                                     .id("dcc-bluetooth-pairing-confirm")
                                     .h(px(34.0))
                                     .px(px(12.0))
-                                    .rounded(px(5.0))
+                                    .rounded(theme.control_radius)
                                     .cursor_pointer()
-                                    .bg(rgb(0x315b46))
+                                    .bg(theme.active_background)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.respond_bluetooth_pairing(true, cx)
                                     }))
@@ -2225,8 +2243,9 @@ impl DeviceControlCenter {
         details: NetworkDetails,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let panel = rgb(0x282a33);
-        let muted = rgb(0xaeb1bd);
+        let theme = self.theme;
+        let panel = theme.dialog_background;
+        let muted = theme.muted_foreground;
         let speed = details
             .network
             .speed_mbps
@@ -2263,7 +2282,7 @@ impl DeviceControlCenter {
                     )
                     .overflow_y_scroll()
                     .p(px(20.0))
-                    .rounded(px(8.0))
+                    .rounded(theme.panel_radius)
                     .bg(panel)
                     .flex()
                     .flex_col()
@@ -2282,12 +2301,12 @@ impl DeviceControlCenter {
                                         div()
                                             .id("dcc-details-close")
                                             .size(px(32.0))
-                                            .rounded(px(5.0))
+                                            .rounded(theme.control_radius)
                                             .flex()
                                             .items_center()
                                             .justify_center()
                                             .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0x343640)))
+                                            .hover(|style| style.bg(theme.hover_background))
                                             .on_click(
                                                 cx.listener(|this, _, _, cx| {
                                                     this.close_details(cx)
@@ -2301,7 +2320,7 @@ impl DeviceControlCenter {
                                 div()
                                     .id("dcc-save-network-settings")
                                     .size(px(32.0))
-                                    .rounded(px(5.0))
+                                    .rounded(theme.control_radius)
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -2309,7 +2328,7 @@ impl DeviceControlCenter {
                                     .when(!details.saving, |button| {
                                         button
                                             .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0x315b46)))
+                                            .hover(|style| style.bg(theme.hover_background))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.request_save_network_settings(cx)
                                             }))
@@ -2334,7 +2353,7 @@ impl DeviceControlCenter {
                         panel.child(
                             div()
                                 .text_size(px(12.0))
-                                .text_color(rgb(0xf2a0a0))
+                                .text_color(theme.error)
                                 .child(message),
                         )
                     }),
@@ -2347,7 +2366,8 @@ impl DeviceControlCenter {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let panel = rgb(0x282a33);
+        let theme = self.theme;
+        let panel = theme.dialog_background;
         div()
             .absolute()
             .inset_0()
@@ -2374,7 +2394,7 @@ impl DeviceControlCenter {
                     )
                     .w(px(360.0))
                     .p(px(20.0))
-                    .rounded(px(8.0))
+                    .rounded(theme.panel_radius)
                     .bg(panel)
                     .flex()
                     .flex_col()
@@ -2393,7 +2413,7 @@ impl DeviceControlCenter {
                             .child(div().text_size(px(18.0)).child(network.label))
                             .child(
                                 div()
-                                    .text_color(rgb(0xaeb1bd))
+                                    .text_color(theme.muted_foreground)
                                     .child("このネットワークにはパスワードが必要です"),
                             )
                             .child(
@@ -2401,13 +2421,13 @@ impl DeviceControlCenter {
                                     .id("dcc-wifi-password")
                                     .h(px(36.0))
                                     .px(px(10.0))
-                                    .rounded(px(5.0))
+                                    .rounded(theme.control_radius)
                                     .border_1()
                                     .border_color(
                                         if self.active_input == Some(InputField::Password) {
-                                            rgb(0x7da7ff)
+                                            theme.focus
                                         } else {
-                                            rgb(0x444752)
+                                            theme.border
                                         },
                                     )
                                     .cursor_pointer()
@@ -2429,7 +2449,7 @@ impl DeviceControlCenter {
                                 modal_view.child(
                                     div()
                                         .text_size(px(12.0))
-                                        .text_color(rgb(0xf2a0a0))
+                                        .text_color(theme.error)
                                         .child(message),
                                 )
                             })
@@ -2443,9 +2463,9 @@ impl DeviceControlCenter {
                                             .id("dcc-password-cancel")
                                             .h(px(34.0))
                                             .px(px(12.0))
-                                            .rounded(px(5.0))
+                                            .rounded(theme.control_radius)
                                             .cursor_pointer()
-                                            .hover(|style| style.bg(rgb(0x3b3e48)))
+                                            .hover(|style| style.bg(theme.hover_background))
                                             .on_click(
                                                 cx.listener(|this, _, _, cx| this.close_modal(cx)),
                                             )
@@ -2456,9 +2476,9 @@ impl DeviceControlCenter {
                                             .id("dcc-password-connect")
                                             .h(px(34.0))
                                             .px(px(12.0))
-                                            .rounded(px(5.0))
+                                            .rounded(theme.control_radius)
                                             .cursor_pointer()
-                                            .bg(rgb(0x315b46))
+                                            .bg(theme.active_background)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.connect_password_network(cx)
                                             }))
@@ -2481,7 +2501,7 @@ impl DeviceControlCenter {
                                 )
                                 .child(
                                     div()
-                                        .text_color(rgb(0xaeb1bd))
+                                        .text_color(theme.muted_foreground)
                                         .child("接続を一度再確立して、新しいIP設定を反映します。"),
                                 )
                                 .child(
@@ -2494,9 +2514,9 @@ impl DeviceControlCenter {
                                                 .id("dcc-settings-cancel")
                                                 .h(px(34.0))
                                                 .px(px(12.0))
-                                                .rounded(px(5.0))
+                                                .rounded(theme.control_radius)
                                                 .cursor_pointer()
-                                                .hover(|style| style.bg(rgb(0x3b3e48)))
+                                                .hover(|style| style.bg(theme.hover_background))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.close_modal(cx)
                                                 }))
@@ -2507,9 +2527,9 @@ impl DeviceControlCenter {
                                                 .id("dcc-settings-confirm")
                                                 .h(px(34.0))
                                                 .px(px(12.0))
-                                                .rounded(px(5.0))
+                                                .rounded(theme.control_radius)
                                                 .cursor_pointer()
-                                                .bg(rgb(0x315b46))
+                                                .bg(theme.active_background)
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.save_network_settings(cx)
                                                 }))

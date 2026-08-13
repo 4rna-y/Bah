@@ -15,6 +15,15 @@ pub struct Config {
     pub wallpapers: BTreeMap<String, PathBuf>,
     /// Notification daemon and popup behaviour.
     pub notifications: NotificationConfig,
+    /// Terminal launch command for the device control centre. The executable is
+    /// the first item; remaining items are passed as literal arguments.
+    pub device_control_center: DeviceControlCenterConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct DeviceControlCenterConfig {
+    pub terminal_command: Vec<String>,
 }
 
 /// Native notification settings. These intentionally cover Bah's behaviour
@@ -93,6 +102,7 @@ impl Default for Config {
             wallpaper: None,
             wallpapers: BTreeMap::new(),
             notifications: NotificationConfig::default(),
+            device_control_center: DeviceControlCenterConfig::default(),
         }
     }
 }

@@ -13,6 +13,9 @@ env_logger = "0.11"
 gpui = { git = "https://github.com/4rna-y/zed", rev = "f005b687a4287536540fe71b898fe63a176ed0d3", default-features = false, features = ["wayland"] }
 gpui_platform = { git = "https://github.com/4rna-y/zed", rev = "f005b687a4287536540fe71b898fe63a176ed0d3", default-features = false, features = ["wayland"] }
 image = "0.25"
+libc = "0.2"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
 librepods = { path = "../librepods/linux-rust" }
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
@@ -21,6 +24,9 @@ toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v5"] }
 zbus = "5.18"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-hyprland = { version = "1.2", features = ["client"] }
 
 [profile.dev]
 opt-level = 1

@@ -17,6 +17,8 @@ pub struct Workspaces {
     active_window_title: Option<String>,
     active_window_icon: Option<PathBuf>,
     jump_list_actions: Vec<crate::hyprland::JumpListAction>,
+    active_window_address: Option<String>,
+    monitors: Vec<crate::hyprland::display::Monitor>,
     active_workspace_id: Option<i32>,
     slide_offset: f32,
     transition_id: u32,
@@ -31,6 +33,8 @@ impl Workspaces {
             active_window_title: snapshot.active_window_title,
             active_window_icon: snapshot.active_window_icon,
             jump_list_actions: snapshot.jump_list_actions,
+            active_window_address: snapshot.active_window_address,
+            monitors: snapshot.monitors,
             active_workspace_id,
             slide_offset: 0.0,
             transition_id: 0,
@@ -57,6 +61,8 @@ impl Workspaces {
         self.active_window_title = snapshot.active_window_title;
         self.active_window_icon = snapshot.active_window_icon;
         self.jump_list_actions = snapshot.jump_list_actions;
+        self.active_window_address = snapshot.active_window_address;
+        self.monitors = snapshot.monitors;
         self.active_workspace_id = next_active_workspace_id;
         active_workspace_changed
     }
@@ -71,6 +77,20 @@ impl Workspaces {
             .filter(|window| window.workspace.id == workspace_id)
             .cloned()
             .collect()
+    }
+
+    /// Returns the immutable IPC state needed when a transient window switcher opens.
+    pub fn switcher_state(&self) -> (Vec<WorkspaceWindow>, Option<String>, Option<String>) {
+        let focused_monitor = self
+            .monitors
+            .iter()
+            .find(|monitor| monitor.focused)
+            .map(|monitor| monitor.name.clone());
+        (
+            self.workspace_windows.clone(),
+            self.active_window_address.clone(),
+            focused_monitor,
+        )
     }
 
     pub fn render(

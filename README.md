@@ -15,6 +15,7 @@
 - `org.freedesktop.Notifications` のセッションD-Busサービスとして通知を受信し、右上（バー直下）の一時ポップアップとトレイへ表示します。アクション、期限、緊急度、進捗、置換、同期スタックタグ、履歴、通知一時停止に対応します。既存の通知デーモンが同名サービスを所有している場合は、そのデーモンとの競合を避けて通知受信を無効にします。
 - `bah notifications` は dunstctl と同じ主要操作（close、history、count、pause、rule、reloadなど）を提供します。Cargo パッケージには既存のキーバインドを移行できる `dunstctl` 互換エントリも含まれます。
 - `.socket.sock` による初期ワークスペース取得と、`.socket2.sock` のworkspace/focused-monitorイベントによる更新
+- WindowsのAlt+Tabと同様に、通常のマップ済みウィンドウをMRU順で個別に切り替えるOverlay。Hyprlandの`toplevel-export`で一回だけ取得したプレビューを表示し、取得できない場合はアプリアイコンを表示します。
 - IPCが利用不能でも、時計だけを表示して起動継続
 
 ## 開発環境と起動
@@ -49,7 +50,31 @@ RUST_LOG=info cargo run -- window config
 ./bah window device-control-center bluetooth
 ```
 
-`window device-control-center` はネットワークページを、`window device-control-center bluetooth` はBluetoothページをBarへ要求してAnchoredPopupで開きます。Barが起動している必要があります。Bluetoothページでは電源切替、接続済み／ペアリング済み機器の接続・切断、周辺機器の探索、新規機器のPIN・確認コードを使ったペアリングと接続を行えます。
+`window device-control-center` は既定のターミナルでDCC TUIを開きます。`network`、`bluetooth`、`display`で開始タブを指定できます。上部タブは`1`/`2`/`3`、項目選択は矢印または`j`/`k`、実行はEnter、終了は`q`またはEscです。GhosttyなどKitty Graphics Protocol対応端末ではディスプレイタブに壁紙プレビューを描画し、非対応端末でも操作は継続します。
+
+## Window Switcher
+
+Bahを常駐起動した状態で、外部キーバインドから次のCLIを呼び出します。`cycle` / `cycle-reverse` は未表示ならOverlayを開いて次／前のMRU候補を選び、表示中なら選択だけを移動します。`commit`だけが選択ウィンドウへフォーカスを移します。マウスクリックも選択のみで、確定はしません。通常のAltキー解放をHyprland設定から`commit`へ割り当ててください。Escapeによるキャンセル操作は設けません。
+
+開発環境からHyprlandが実行するバイナリを更新するには、リポジトリ直下で`./build.sh`を実行します。リリースビルドは`~/.local/lib/bah/bah`へ配置され、NixのWayland/Vulkan共有ライブラリを設定するランチャーを`~/.local/bin/bah`（互換名`Bah`）へ配置します。配置先は`BAH_INSTALL_DIR`（または`XDG_BIN_HOME`）で変更できます。
+
+```bash
+bah switcher cycle
+bah switcher cycle-reverse
+bah switcher select-next
+bah switcher select-previous
+bah switcher commit
+bah switcher close
+```
+
+Hyprlandの設定例です。
+
+```ini
+bind = ALT, TAB, exec, bah switcher cycle
+bind = ALT SHIFT, TAB, exec, bah switcher cycle-reverse
+bindr = , Alt_L, exec, bah switcher commit
+bindr = , Alt_R, exec, bah switcher commit
+```
 
 ## デバイスコントロールの動作環境
 
@@ -82,6 +107,11 @@ bar_height = 36.0
 # DCCのディスプレイページで設定する出力別の壁紙です。
 # [wallpapers]
 # DP-1 = "/home/user/Pictures/external.png"
+
+# DCCを開く端末。先頭が実行ファイル、以降はそのまま渡す引数です。
+# 未設定時はTERMINAL、Ghostty、foot、kitty等を順に検出します。
+# [device_control_center]
+# terminal_command = ["ghostty", "--gtk-single-instance=false"]
 
 [notifications]
 # dunst の既定値と同じ上限・履歴数。critical_timeout_seconds = 0 は手動で閉じるまで表示します。
@@ -138,13 +168,13 @@ dunstctl close-all
 
 ## ディスプレイ
 
-`bah window device-control-center display`、またはDCCの「ディスプレイ」ページから、接続中のモニターをドラッグして配置できます。選択したモニターを「メインモニターにする」と、当該モニターを`0x0`に固定したまま他モニターの相対位置を維持します。適用時には`~/.config/hypr/bah_displays.lua`を生成し、`hyprland.lua`へBah管理の`require("bah_displays")`を追加します。workspace 1はメインモニターへ割り当てられます。
+`bah window device-control-center display`、またはDCC TUIの「Display」タブから、接続中のモニターを選択して矢印キーで配置できます。Shift+矢印は100px、Ctrl+矢印は1px単位で移動します。適用時には`~/.config/hypr/bah_displays.lua`を生成し、`hyprland.lua`へBah管理の`require("bah_displays")`を追加します。workspace 1はメインモニターへ割り当てられます。
 
 壁紙は出力ごとに選択できます。個別設定がない出力は従来の共通`wallpaper`を使用します。
 
 ## 視認性と外観
 
-バーのWindow背景は透明ですが、描画するルート要素には `RGB(18, 18, 22)`、不透明度約72%の暗色背景を常に描画します。これにより、Hyprlandのblurが無効でも明るい・暗い・白黒混在・細かい模様・高彩度の壁紙上で文字を壁紙へ直接重ねずに表示します。
+BarとNotification TrayのWindow背景は透明ですが、描画するルート要素には `RGB(18, 18, 22)`、不透明度約72%の暗色背景を常に描画します。Popoverは約88%、DCC・通知カードは約94%へ密度を上げ、壁紙上でも情報階層と可読性を保ちます。
 
 - 主文字色: `RGB(245, 245, 247)`（時計、アクティブワークスペース）
 - 副文字色: `RGB(202, 202, 210)`（非アクティブワークスペース）
@@ -153,7 +183,7 @@ dunstctl close-all
 
 文字色は壁紙の輝度に応じて切り替えません。これは白黒が混在する壁紙でも外観と視認性を安定させるためです。GPUI revisionには独立したテキストシャドウAPIがないため、テキストシャドウは使用せず、バー背景でコントラストを確保します。
 
-白い壁紙を通常モードの最悪条件として合成すると、バー背景は概ね `RGB(84, 84, 87)` になり、主文字色は約 `6.9:1`、副文字色は約 `4.6:1` のコントラストになります。暗い壁紙では背景がさらに暗くなるため、これより高いコントラストになります。
+白い壁紙を通常モードの最悪条件として合成すると、バー背景は概ね `RGB(84, 84, 87)` になります。主文字は約 `6.9:1`、副文字は約 `4.6:1` のコントラストを目標とし、暗い壁紙ではさらに高くなります。
 
 壁紙を変更できる環境では、以下を手動確認してください。blurの有無にかかわらず、時計とアクティブワークスペースが読み取れ、非アクティブワークスペースが判別できることを確認します。
 
@@ -175,7 +205,13 @@ BAH_HIGH_CONTRAST=1 cargo run
 BAH_DISABLE_TRANSPARENCY=1 cargo run
 ```
 
-両方の環境変数は `1`、`true`、または `yes` を受け付けます。それ以外の値や解析失敗時は無効（通常モード）へフォールバックします。
+より透明なShellを試す場合は、BarとNotification Trayだけを約50%不透明にします。明るい壁紙かつblurなしでは可読性を保証しないため、任意の表示モードです。
+
+```bash
+BAH_GLASS=1 cargo run
+```
+
+これらの環境変数は `1`、`true`、または `yes` を受け付けます。それ以外の値や解析失敗時は無効（通常モード）へフォールバックします。`BAH_DISABLE_TRANSPARENCY`、`BAH_HIGH_CONTRAST`、`BAH_GLASS` を併用した場合は、この順で優先されます。
 
 Bah 自身の常駐メモリ使用量を INFO ログへ1秒ごとに出力するには、起動時に次を指定します。
 

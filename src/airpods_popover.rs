@@ -1,14 +1,14 @@
 use std::{f32::consts::TAU, path::PathBuf};
 
 use async_channel::Sender;
-use gpui::{Context, Render, Size, Window, canvas, div, img, point, prelude::*, px, rgb};
+use gpui::{Context, Render, Size, Window, canvas, div, img, point, prelude::*, px};
 
 use crate::{
     modules::{
         airpods::AirPodsListeningMode,
         system_controls::{ControlAction, ControlSnapshot},
     },
-    theme::{BarTheme, ui_font},
+    theme::{BarTheme, SurfaceRole, ui_font},
 };
 
 const POPOVER_SIZE: f32 = 280.0;
@@ -114,10 +114,10 @@ impl Render for AirPodsPopover {
         div()
             .size_full()
             .p(px(14.0))
-            .rounded(px(8.0))
+            .rounded(theme.panel_radius)
             .border_1()
             .border_color(theme.border)
-            .bg(theme.background.alpha(1.0))
+            .bg(theme.surface(SurfaceRole::Floating))
             .text_color(theme.foreground)
             .font(ui_font())
             .flex()
@@ -191,7 +191,7 @@ impl Render for AirPodsPopover {
                 root.child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(0xffa6a6))
+                        .text_color(theme.error)
                         .child(message),
                 )
             })
@@ -229,7 +229,7 @@ fn mode_button(
                 .id(format!("airpods-mode-{id}"))
                 .w_full()
                 .h(px(34.0))
-                .rounded(px(6.0))
+                .rounded(theme.control_radius)
                 .border_1()
                 .border_color(theme.border)
                 .flex()
@@ -244,7 +244,7 @@ fn mode_button(
                 .bg(if is_selected {
                     theme.active_background
                 } else {
-                    theme.background
+                    theme.container_background
                 })
                 .opacity(if enabled { 1.0 } else { 0.45 })
                 .cursor_pointer()
@@ -308,7 +308,7 @@ fn progress_ring(percent: Option<u8>, theme: BarTheme) -> impl IntoElement {
                     }
                 }
                 if let Ok(path) = foreground.build() {
-                    window.paint_path(path, rgb(0x63d297));
+                    window.paint_path(path, theme.success);
                 }
             }
         },

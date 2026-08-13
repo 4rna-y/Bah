@@ -51,6 +51,13 @@ impl Monitor {
         )
     }
 
+    pub fn logical_position(&self) -> (i32, i32) {
+        (
+            (self.x as f32 / self.scale.max(0.01)).round() as i32,
+            (self.y as f32 / self.scale.max(0.01)).round() as i32,
+        )
+    }
+
     fn mode(&self) -> String {
         format!("{}x{}@{:.2}", self.width, self.height, self.refresh_rate)
     }

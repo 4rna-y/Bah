@@ -14,7 +14,8 @@ use log::{error, info, warn};
 pub use client::{HyprlandClient, SocketPaths};
 pub use events::IpcUpdate;
 pub use jump_list::JumpListAction;
-pub use types::{Workspace, WorkspaceSnapshot, WorkspaceWindow};
+#[allow(unused_imports)]
+pub use types::{WindowWorkspace, Workspace, WorkspaceSnapshot, WorkspaceWindow};
 
 /// Requests a workspace change without blocking GPUI's drawing thread.
 pub fn switch_to_workspace(id: i32) {
@@ -27,6 +28,22 @@ pub fn switch_to_workspace(id: i32) {
             {
                 Ok(()) => info!("switched to workspace {id}"),
                 Err(error) => warn!("failed to switch to workspace {id}: {error}"),
+            }
+        });
+}
+
+/// Focuses a window by its Hyprland address without blocking GPUI's drawing thread.
+pub fn focus_window(address: String) {
+    let _ = thread::Builder::new()
+        .name("bah-window-switch".to_string())
+        .spawn(move || {
+            let selector = format!("address:{address}");
+            let dispatcher = format!("hl.dsp.focus({{ window = {selector:?} }})");
+            match SocketPaths::from_environment()
+                .and_then(|paths| HyprlandClient::new(paths).dispatch(&dispatcher))
+            {
+                Ok(()) => info!("focused window {address}"),
+                Err(error) => warn!("failed to focus window {address}: {error}"),
             }
         });
 }

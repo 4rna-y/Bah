@@ -29,16 +29,17 @@ use crate::{
         notifications::{NotificationStore, start_server},
         system_controls,
     },
-    theme::BarTheme,
+    theme::{BarTheme, VisualMode},
     wallpaper::Wallpaper,
 };
 
 const CONFIG_WINDOW_LOCK_FILE: &str = "bah/config-window.lock";
 const DEVICE_CONTROL_CENTER_SOCKET_FILE: &str = "bah/device-control-center.sock";
+const WINDOW_SWITCHER_SOCKET_FILE: &str = "bah/window-switcher.sock";
 const WALLPAPER_LOCK_FILE: &str = "bah/wallpaper.lock";
 const WALLPAPER_PID_FILE: &str = "bah/wallpaper.pid";
 const USAGE: &str = "usage: bah [--memusg] [--wgpu-backend BACKENDS] [--vk-driver-files PATH] \
-     [notifications COMMAND|window config|window device-control-center [network|bluetooth|display]|wallpaper [set PATH|unset]]";
+     [notifications COMMAND|switcher COMMAND|window config|window device-control-center [network|bluetooth|display]|dcc [network|bluetooth|display]|wallpaper [set PATH|unset]]";
 
 /// Options that must be applied before GPUI initializes its graphics backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,15 +183,44 @@ fn launch_device_control_center(route: DeviceControlCenterRoute) {
                     return;
                 }
             };
-            let mut command = Command::new(executable);
-            command.args(["window", "device-control-center", route.page.as_arg()]);
+            let terminal = resolve_terminal();
+            let Some((program, mut arguments)) = terminal else {
+                error!("could not find a terminal emulator for the device control center");
+                return;
+            };
+            arguments.push("-e".into());
+            arguments.push(executable.into_os_string());
+            arguments.push("dcc".into());
+            arguments.push(route.page.as_arg().into());
             if let Some(ssid) = route.ssid {
-                command.args(["--ssid-hex", &encode_hex_ssid(&ssid)]);
+                arguments.push("--ssid-hex".into());
+                arguments.push(encode_hex_ssid(&ssid).into());
             }
-            if let Err(error) = command.spawn() {
+            if let Err(error) = Command::new(program).args(arguments).spawn() {
                 error!("failed to launch device control center: {error}");
             }
         });
+}
+
+fn resolve_terminal() -> Option<(OsString, Vec<OsString>)> {
+    let configured = Config::load()
+        .unwrap_or_default()
+        .device_control_center
+        .terminal_command;
+    if let Some((program, arguments)) = configured.split_first()
+        && !program.trim().is_empty()
+    {
+        return Some((program.into(), arguments.iter().map(Into::into).collect()));
+    }
+    if let Some(command) = env::var_os("TERMINAL").filter(|value| !value.is_empty()) {
+        // TERMINAL is intentionally accepted only as an executable name: treating it as a shell
+        // command would make a user configuration value executable shell input.
+        return Some((command, Vec::new()));
+    }
+    ["ghostty", "foot", "kitty", "wezterm", "alacritty"]
+        .into_iter()
+        .find(|candidate| Command::new(candidate).arg("--version").output().is_ok())
+        .map(|candidate| (OsString::from(candidate), Vec::new()))
 }
 
 fn device_control_center_socket_path() -> io::Result<PathBuf> {
@@ -212,16 +242,9 @@ fn write_device_control_center_route(route: &DeviceControlCenterRoute) -> io::Re
     stream.write_all(b"\n")
 }
 
-/// Requests the DCC from an in-process surface without launching another
-/// executable. The Bar owns the persistent popup parent and opens the DCC.
+/// Opens the DCC in the configured terminal without blocking a GPUI callback.
 pub(crate) fn request_device_control_center(route: DeviceControlCenterRoute) {
-    let _ = thread::Builder::new()
-        .name("bah-device-control-center-request".to_string())
-        .spawn(move || {
-            if let Err(error) = write_device_control_center_route(&route) {
-                error!("failed to request device control center: {error}");
-            }
-        });
+    launch_device_control_center(route);
 }
 
 fn start_device_control_center_route_server(
@@ -293,13 +316,87 @@ impl Drop for DeviceControlCenterRouteServer {
     }
 }
 
+fn window_switcher_socket_path() -> io::Result<PathBuf> {
+    runtime_lock_path(WINDOW_SWITCHER_SOCKET_FILE)
+}
+
+fn run_switcher_command(command: SwitcherCommand) {
+    let path = match window_switcher_socket_path() {
+        Ok(path) => path,
+        Err(error) => {
+            error!("could not resolve the window-switcher socket path: {error}");
+            return;
+        }
+    };
+    match UnixStream::connect(path) {
+        Ok(mut stream) => {
+            if let Err(error) = writeln!(stream, "{}", command.as_wire()) {
+                error!("failed to send switcher command: {error}");
+            }
+        }
+        Err(error) => error!("Bah is not running; cannot control the window switcher: {error}"),
+    }
+}
+
+fn start_window_switcher_server(
+    sender: async_channel::Sender<SwitcherCommand>,
+) -> io::Result<WindowSwitcherCommandServer> {
+    let path = window_switcher_socket_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+    let listener = UnixListener::bind(&path)?;
+    let worker = listener.try_clone()?;
+    thread::Builder::new()
+        .name("bah-window-switcher-command".to_string())
+        .spawn(move || {
+            for stream in worker.incoming().flatten() {
+                let mut request = String::new();
+                let mut stream = stream;
+                if stream.read_to_string(&mut request).is_err() {
+                    continue;
+                }
+                let Some(command) = SwitcherCommand::parse(OsStr::new(request.trim())) else {
+                    warn!(
+                        "ignoring unknown window-switcher command: {:?}",
+                        request.trim()
+                    );
+                    continue;
+                };
+                if sender.send_blocking(command).is_err() {
+                    return;
+                }
+            }
+        })?;
+    Ok(WindowSwitcherCommandServer {
+        _listener: listener,
+        path,
+    })
+}
+
+pub struct WindowSwitcherCommandServer {
+    _listener: UnixListener,
+    path: PathBuf,
+}
+
+impl Drop for WindowSwitcherCommandServer {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Selects which surface this invocation creates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunMode {
     Bar,
     ConfigWindow,
     DeviceControlCenter(DeviceControlCenterRoute),
+    DeviceControlCenterTui(DeviceControlCenterRoute),
     Notifications(Vec<OsString>),
+    Switcher(SwitcherCommand),
     Wallpaper,
     WallpaperSet(PathBuf),
     WallpaperUnset,
@@ -329,6 +426,48 @@ pub struct DeviceControlCenterRoute {
     pub ssid: Option<Vec<u8>>,
 }
 
+/// Commands accepted by the persistent window-switcher control socket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwitcherCommand {
+    Open,
+    Cycle,
+    CycleReverse,
+    SelectPrevious,
+    SelectNext,
+    Commit,
+    Close,
+    Refresh,
+}
+
+impl SwitcherCommand {
+    fn parse(value: &OsStr) -> Option<Self> {
+        match value.to_str()? {
+            "open" => Some(Self::Open),
+            "cycle" => Some(Self::Cycle),
+            "cycle-reverse" => Some(Self::CycleReverse),
+            "select-previous" => Some(Self::SelectPrevious),
+            "select-next" => Some(Self::SelectNext),
+            "commit" => Some(Self::Commit),
+            "close" => Some(Self::Close),
+            "refresh" => Some(Self::Refresh),
+            _ => None,
+        }
+    }
+
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Cycle => "cycle",
+            Self::CycleReverse => "cycle-reverse",
+            Self::SelectPrevious => "select-previous",
+            Self::SelectNext => "select-next",
+            Self::Commit => "commit",
+            Self::Close => "close",
+            Self::Refresh => "refresh",
+        }
+    }
+}
+
 impl RunMode {
     fn from_args<I, S>(arguments: I) -> Result<Self, String>
     where
@@ -344,6 +483,9 @@ impl RunMode {
             [notifications, command @ ..] if notifications == "notifications" => {
                 Ok(Self::Notifications(command.to_vec()))
             }
+            [switcher, command] if switcher == "switcher" => SwitcherCommand::parse(command)
+                .map(Self::Switcher)
+                .ok_or_else(|| USAGE.to_string()),
             [window, config] if window == "window" && config == "config" => Ok(Self::ConfigWindow),
             [window, device_control_center]
                 if window == "window" && device_control_center == "device-control-center" =>
@@ -392,6 +534,32 @@ impl RunMode {
                     ssid: Some(decode_hex_ssid(ssid)?),
                 }))
             }
+            [dcc] if dcc == "dcc" => Ok(Self::DeviceControlCenterTui(
+                DeviceControlCenterRoute::default(),
+            )),
+            [dcc, page] if dcc == "dcc" && page == "network" => Ok(Self::DeviceControlCenterTui(
+                DeviceControlCenterRoute::default(),
+            )),
+            [dcc, page] if dcc == "dcc" && page == "bluetooth" => {
+                Ok(Self::DeviceControlCenterTui(DeviceControlCenterRoute {
+                    page: DeviceControlCenterPage::Bluetooth,
+                    ssid: None,
+                }))
+            }
+            [dcc, page] if dcc == "dcc" && page == "display" => {
+                Ok(Self::DeviceControlCenterTui(DeviceControlCenterRoute {
+                    page: DeviceControlCenterPage::Display,
+                    ssid: None,
+                }))
+            }
+            [dcc, page, flag, ssid]
+                if dcc == "dcc" && page == "network" && flag == "--ssid-hex" =>
+            {
+                Ok(Self::DeviceControlCenterTui(DeviceControlCenterRoute {
+                    page: DeviceControlCenterPage::Network,
+                    ssid: Some(decode_hex_ssid(ssid)?),
+                }))
+            }
             [wallpaper] if wallpaper == "wallpaper" => Ok(Self::Wallpaper),
             [wallpaper, set, path] if wallpaper == "wallpaper" && set == "set" => {
                 Ok(Self::WallpaperSet(PathBuf::from(path)))
@@ -410,7 +578,9 @@ pub fn run(mode: RunMode, config: Config) {
         RunMode::Bar => run_bar(config),
         RunMode::ConfigWindow => run_config_window(config),
         RunMode::DeviceControlCenter(route) => run_device_control_center(route),
+        RunMode::DeviceControlCenterTui(route) => crate::tui_device_control_center::run(route),
         RunMode::Notifications(arguments) => run_notifications(arguments),
+        RunMode::Switcher(command) => run_switcher_command(command),
         RunMode::Wallpaper => run_wallpaper(config),
         RunMode::WallpaperSet(_) | RunMode::WallpaperUnset => {
             unreachable!("commands exit before run")
@@ -672,8 +842,11 @@ fn open_wallpaper_surfaces(
                 })),
                 kind: WindowKind::LayerShell(LayerShellOptions {
                     namespace,
-                    layer: Layer::Bottom,
+                    layer: Layer::Background,
                     anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                    // Extend behind the bar's exclusive zone so its translucent
+                    // background is composited over the wallpaper.
+                    exclusive_zone: Some(px(-1.0)),
                     keyboard_interactivity: KeyboardInteractivity::None,
                     ..Default::default()
                 }),
@@ -688,7 +861,7 @@ fn open_wallpaper_surfaces(
     }
 }
 
-fn display_id_for_output(cx: &App, output: &str) -> Option<DisplayId> {
+pub(crate) fn display_id_for_output(cx: &App, output: &str) -> Option<DisplayId> {
     let expected = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, output.as_bytes());
     cx.displays()
         .into_iter()
@@ -716,20 +889,24 @@ fn run_bar(config: Config) {
                 return;
             }
         };
+        let (switcher_command_sender, switcher_command_receiver) = async_channel::unbounded();
+        let switcher_command_server = match start_window_switcher_server(switcher_command_sender) {
+            Ok(server) => server,
+            Err(error) => {
+                error!("could not start window switcher command server: {error}");
+                return;
+            }
+        };
 
         let theme = BarTheme::from_environment(config.bar_height);
         let height = theme.bar_height;
         info!(
-            "visual mode: {}{}",
-            if theme.high_contrast {
-                "high contrast"
-            } else {
-                "standard"
-            },
-            if theme.transparency_disabled {
-                ", transparency disabled"
-            } else {
-                ""
+            "visual mode: {}",
+            match theme.visual_mode {
+                VisualMode::Readable => "readable",
+                VisualMode::Glass => "glass",
+                VisualMode::HighContrast => "high contrast",
+                VisualMode::Opaque => "opaque",
             }
         );
         // Wayland popups are positioned in their parent's surface-local
@@ -800,6 +977,8 @@ fn run_bar(config: Config) {
                         dcc_route_receiver,
                         dcc_route_server,
                         dcc_popup_anchor,
+                        switcher_command_receiver,
+                        switcher_command_server,
                         theme,
                         cx,
                     )
@@ -819,9 +998,7 @@ fn wallpaper_is_configured(config: &Config) -> bool {
 }
 
 fn run_device_control_center(route: DeviceControlCenterRoute) {
-    if let Err(error) = write_device_control_center_route(&route) {
-        error!("Bar is not running; cannot open the device control center popover: {error}");
-    }
+    launch_device_control_center(route);
 }
 
 fn run_notifications(arguments: Vec<OsString>) {
@@ -864,7 +1041,10 @@ fn run_config_window(config: Config) {
                 window_min_size: Some(Size::new(px(480.0), px(320.0))),
                 ..Default::default()
             },
-            move |_, cx| cx.new(|cx| ConfigWindow::new(config, lock, cx)),
+            move |_, cx| {
+                let theme = BarTheme::from_environment(config.bar_height);
+                cx.new(|cx| ConfigWindow::new(config, lock, theme, cx))
+            },
         );
 
         match result {
@@ -978,7 +1158,7 @@ mod tests {
 
     use super::{
         DeviceControlCenterPage, DeviceControlCenterRoute, RunMode, StartupOptions,
-        wallpaper_is_configured,
+        SwitcherCommand, wallpaper_is_configured,
     };
     use crate::config::Config;
 
@@ -1009,6 +1189,13 @@ mod tests {
             ))
         );
         assert_eq!(
+            RunMode::from_args(["dcc", "display"]),
+            Ok(RunMode::DeviceControlCenterTui(DeviceControlCenterRoute {
+                page: DeviceControlCenterPage::Display,
+                ssid: None,
+            }))
+        );
+        assert_eq!(
             RunMode::from_args([
                 "window",
                 "device-control-center",
@@ -1036,6 +1223,14 @@ mod tests {
             }))
         );
         assert_eq!(RunMode::from_args(["wallpaper"]), Ok(RunMode::Wallpaper));
+        assert_eq!(
+            RunMode::from_args(["switcher", "cycle-reverse"]),
+            Ok(RunMode::Switcher(SwitcherCommand::CycleReverse))
+        );
+        assert_eq!(
+            RunMode::from_args(["switcher", "commit"]),
+            Ok(RunMode::Switcher(SwitcherCommand::Commit))
+        );
         assert_eq!(
             RunMode::from_args(["wallpaper", "set", "resrc/wallpaper.png"]),
             Ok(RunMode::WallpaperSet("resrc/wallpaper.png".into()))

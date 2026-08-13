@@ -75,8 +75,11 @@ impl HyprlandClient {
             .context("Hyprland returned invalid active-workspace JSON")?;
         let active_window: ActiveWindow = serde_json::from_str(&self.command("j/activewindow")?)
             .context("Hyprland returned invalid active-window JSON")?;
+        let monitors = self.display_layout()?.monitors;
         let active_window_title =
             (!active_window.title.trim().is_empty()).then_some(active_window.title);
+        let active_window_address =
+            (!active_window.address.trim().is_empty()).then_some(active_window.address.clone());
         let active_window_icon = self
             .icon_resolver
             .resolve(&active_window.app_id, &active_window.initial_app_id);
@@ -106,6 +109,8 @@ impl HyprlandClient {
         Ok(WorkspaceSnapshot {
             workspaces: Workspace::display_set(workspaces, active.id),
             workspace_windows,
+            monitors,
+            active_window_address,
             active_window_title,
             active_window_icon,
             jump_list_actions,

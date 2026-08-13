@@ -8,7 +8,7 @@ use crate::{
         CloseReason, Notification, NotificationEvent, NotificationStore, SharedNotificationStore,
         emit_action_invoked, emit_notification_closed,
     },
-    theme::{BarTheme, ui_font},
+    theme::{BarTheme, SurfaceRole, ui_font},
 };
 
 /// Right-aligned transient notification surface. It intentionally stays alive
@@ -63,7 +63,7 @@ impl NotificationPopupStack {
         let urgency_color = match notification.urgency {
             crate::modules::notifications::Urgency::Low => theme.muted_foreground,
             crate::modules::notifications::Urgency::Normal => theme.foreground,
-            crate::modules::notifications::Urgency::Critical => gpui::rgb(0xff6b6b),
+            crate::modules::notifications::Urgency::Critical => theme.error,
         };
         let body = notification.body.clone();
         let summary = notification.summary.clone();
@@ -93,8 +93,8 @@ impl NotificationPopupStack {
             .id(("notification-popup", id))
             .m(px(6.0))
             .p(px(10.0))
-            .rounded(px(8.0))
-            .bg(theme.background.alpha(0.97))
+            .rounded(theme.panel_radius)
+            .bg(theme.surface(SurfaceRole::Dialog))
             .border_1()
             .border_color(theme.border)
             .text_color(theme.foreground)

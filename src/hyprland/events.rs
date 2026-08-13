@@ -27,6 +27,8 @@ pub fn refreshes_workspaces(line: &str) -> bool {
             | Some("closewindow")
             | Some("movewindow")
             | Some("movewindowv2")
+            | Some("changefloatingmode")
+            | Some("fullscreen")
             | Some("windowtitle")
             | Some("windowtitlev2")
     )

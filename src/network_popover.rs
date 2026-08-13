@@ -6,7 +6,7 @@ use crate::{
     modules::system_controls::{
         ControlAction, ControlSnapshot, WifiConnectionEvent, WifiNetwork, WifiSecurity,
     },
-    theme::{BarTheme, ui_font},
+    theme::{BarTheme, SurfaceRole, ui_font},
 };
 
 const POPOVER_MIN_WIDTH: f32 = 180.0;
@@ -157,10 +157,10 @@ impl Render for NetworkPopover {
         div()
             .size_full()
             .p(px(POPOVER_PADDING))
-            .rounded(px(8.0))
+            .rounded(theme.panel_radius)
             .border_1()
             .border_color(theme.border)
-            .bg(theme.background.alpha(1.0))
+            .bg(theme.surface(SurfaceRole::Floating))
             .text_color(theme.foreground)
             .font(ui_font())
             .text_size(px(12.0))
@@ -179,7 +179,7 @@ impl Render for NetworkPopover {
                         .child(
                             div()
                                 .text_size(px(15.0))
-                                .text_color(gpui::rgb(0x63d297))
+                                .text_color(theme.success)
                                 .child("✓"),
                         ),
                 )
@@ -203,7 +203,7 @@ impl Render for NetworkPopover {
                             .items_center()
                             .cursor_pointer()
                             .when(wifi_enabled, |toggle| {
-                                toggle.justify_end().bg(gpui::rgb(0x63d297))
+                                toggle.justify_end().bg(theme.success)
                             })
                             .when(!wifi_enabled, |toggle| {
                                 toggle.justify_start().bg(theme.border)
@@ -268,7 +268,7 @@ impl Render for NetworkPopover {
                                 row.child(
                                     div()
                                         .text_size(px(15.0))
-                                        .text_color(gpui::rgb(0x63d297))
+                                        .text_color(theme.success)
                                         .child("✓"),
                                 )
                             });
@@ -364,7 +364,7 @@ impl Render for NetworkPopover {
                                 row.child(
                                     div()
                                         .text_size(px(15.0))
-                                        .text_color(gpui::rgb(0x63d297))
+                                        .text_color(theme.success)
                                         .child("✓"),
                                 )
                             });
