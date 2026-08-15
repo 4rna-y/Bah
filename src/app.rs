@@ -22,6 +22,7 @@ use log::{error, info, warn};
 
 use crate::{
     bar::Bar,
+    clipboard::{ClipboardHistory, start_collector},
     config::Config,
     config_window::ConfigWindow,
     hyprland,
@@ -36,10 +37,12 @@ use crate::{
 const CONFIG_WINDOW_LOCK_FILE: &str = "bah/config-window.lock";
 const DEVICE_CONTROL_CENTER_SOCKET_FILE: &str = "bah/device-control-center.sock";
 const WINDOW_SWITCHER_SOCKET_FILE: &str = "bah/window-switcher.sock";
+const CLIPBOARD_SOCKET_FILE: &str = "bah/clipboard.sock";
+const SCREENSHOT_SOCKET_FILE: &str = "bah/screenshot.sock";
 const WALLPAPER_LOCK_FILE: &str = "bah/wallpaper.lock";
 const WALLPAPER_PID_FILE: &str = "bah/wallpaper.pid";
 const USAGE: &str = "usage: bah [--memusg] [--wgpu-backend BACKENDS] [--vk-driver-files PATH] \
-     [notifications COMMAND|switcher COMMAND|window config|window device-control-center [network|bluetooth|display]|dcc [network|bluetooth|display]|wallpaper [set PATH|unset]]";
+     [notifications COMMAND|switcher COMMAND|clipboard COMMAND|screenshot|window config|window device-control-center [network|bluetooth|display]|dcc [network|bluetooth|display]|wallpaper [set PATH|unset]]";
 
 /// Options that must be applied before GPUI initializes its graphics backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -377,6 +380,144 @@ fn start_window_switcher_server(
     })
 }
 
+fn clipboard_socket_path() -> io::Result<PathBuf> {
+    runtime_lock_path(CLIPBOARD_SOCKET_FILE)
+}
+
+fn screenshot_socket_path() -> io::Result<PathBuf> {
+    runtime_lock_path(SCREENSHOT_SOCKET_FILE)
+}
+
+fn run_screenshot_command() {
+    let path = match screenshot_socket_path() {
+        Ok(path) => path,
+        Err(error) => {
+            error!("could not resolve the screenshot socket path: {error}");
+            return;
+        }
+    };
+    match UnixStream::connect(path) {
+        Ok(mut stream) => {
+            if let Err(error) = writeln!(stream, "capture") {
+                error!("failed to send screenshot command: {error}");
+            }
+        }
+        Err(error) => error!("Bah is not running; cannot capture a screenshot: {error}"),
+    }
+}
+
+fn start_screenshot_server(
+    sender: async_channel::Sender<()>,
+) -> io::Result<ScreenshotCommandServer> {
+    let path = screenshot_socket_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+    let listener = UnixListener::bind(&path)?;
+    let worker = listener.try_clone()?;
+    thread::Builder::new()
+        .name("bah-screenshot-command".to_string())
+        .spawn(move || {
+            for stream in worker.incoming().flatten() {
+                let mut request = String::new();
+                let mut stream = stream;
+                if stream.read_to_string(&mut request).is_err() {
+                    continue;
+                }
+                if request.trim() != "capture" {
+                    warn!("ignoring unknown screenshot command: {:?}", request.trim());
+                    continue;
+                }
+                if sender.send_blocking(()).is_err() {
+                    return;
+                }
+            }
+        })?;
+    Ok(ScreenshotCommandServer {
+        _listener: listener,
+        path,
+    })
+}
+
+pub struct ScreenshotCommandServer {
+    _listener: UnixListener,
+    path: PathBuf,
+}
+
+impl Drop for ScreenshotCommandServer {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn run_clipboard_command(command: ClipboardCommand) {
+    let path = match clipboard_socket_path() {
+        Ok(path) => path,
+        Err(error) => {
+            error!("could not resolve the clipboard socket path: {error}");
+            return;
+        }
+    };
+    match UnixStream::connect(path) {
+        Ok(mut stream) => {
+            if let Err(error) = writeln!(stream, "{}", command.as_wire()) {
+                error!("failed to send clipboard command: {error}");
+            }
+        }
+        Err(error) => error!("Bah is not running; cannot control clipboard history: {error}"),
+    }
+}
+
+fn start_clipboard_server(
+    sender: async_channel::Sender<ClipboardCommand>,
+) -> io::Result<ClipboardCommandServer> {
+    let path = clipboard_socket_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+    let listener = UnixListener::bind(&path)?;
+    let worker = listener.try_clone()?;
+    thread::Builder::new()
+        .name("bah-clipboard-command".to_string())
+        .spawn(move || {
+            for stream in worker.incoming().flatten() {
+                let mut request = String::new();
+                let mut stream = stream;
+                if stream.read_to_string(&mut request).is_err() {
+                    continue;
+                }
+                let Some(command) = ClipboardCommand::parse(OsStr::new(request.trim())) else {
+                    warn!("ignoring unknown clipboard command: {:?}", request.trim());
+                    continue;
+                };
+                if sender.send_blocking(command).is_err() {
+                    return;
+                }
+            }
+        })?;
+    Ok(ClipboardCommandServer {
+        _listener: listener,
+        path,
+    })
+}
+
+pub struct ClipboardCommandServer {
+    _listener: UnixListener,
+    path: PathBuf,
+}
+
+impl Drop for ClipboardCommandServer {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 pub struct WindowSwitcherCommandServer {
     _listener: UnixListener,
     path: PathBuf,
@@ -397,9 +538,49 @@ pub enum RunMode {
     DeviceControlCenterTui(DeviceControlCenterRoute),
     Notifications(Vec<OsString>),
     Switcher(SwitcherCommand),
+    Clipboard(ClipboardCommand),
+    Screenshot,
     Wallpaper,
     WallpaperSet(PathBuf),
     WallpaperUnset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipboardCommand {
+    Toggle,
+    Open,
+    Close,
+    Previous,
+    Next,
+    Select,
+    Clear,
+}
+
+impl ClipboardCommand {
+    fn parse(value: &OsStr) -> Option<Self> {
+        match value.to_str()? {
+            "toggle" => Some(Self::Toggle),
+            "open" => Some(Self::Open),
+            "close" => Some(Self::Close),
+            "previous" => Some(Self::Previous),
+            "next" => Some(Self::Next),
+            "select" => Some(Self::Select),
+            "clear" => Some(Self::Clear),
+            _ => None,
+        }
+    }
+
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::Toggle => "toggle",
+            Self::Open => "open",
+            Self::Close => "close",
+            Self::Previous => "previous",
+            Self::Next => "next",
+            Self::Select => "select",
+            Self::Clear => "clear",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
@@ -486,6 +667,10 @@ impl RunMode {
             [switcher, command] if switcher == "switcher" => SwitcherCommand::parse(command)
                 .map(Self::Switcher)
                 .ok_or_else(|| USAGE.to_string()),
+            [clipboard, command] if clipboard == "clipboard" => ClipboardCommand::parse(command)
+                .map(Self::Clipboard)
+                .ok_or_else(|| USAGE.to_string()),
+            [screenshot] if screenshot == "screenshot" => Ok(Self::Screenshot),
             [window, config] if window == "window" && config == "config" => Ok(Self::ConfigWindow),
             [window, device_control_center]
                 if window == "window" && device_control_center == "device-control-center" =>
@@ -581,6 +766,8 @@ pub fn run(mode: RunMode, config: Config) {
         RunMode::DeviceControlCenterTui(route) => crate::tui_device_control_center::run(route),
         RunMode::Notifications(arguments) => run_notifications(arguments),
         RunMode::Switcher(command) => run_switcher_command(command),
+        RunMode::Clipboard(command) => run_clipboard_command(command),
+        RunMode::Screenshot => run_screenshot_command(),
         RunMode::Wallpaper => run_wallpaper(config),
         RunMode::WallpaperSet(_) | RunMode::WallpaperUnset => {
             unreachable!("commands exit before run")
@@ -897,6 +1084,25 @@ fn run_bar(config: Config) {
                 return;
             }
         };
+        let (clipboard_command_sender, clipboard_command_receiver) = async_channel::unbounded();
+        let clipboard_command_server = match start_clipboard_server(clipboard_command_sender) {
+            Ok(server) => server,
+            Err(error) => {
+                error!("could not start clipboard command server: {error}");
+                return;
+            }
+        };
+        let (clipboard_update_sender, clipboard_update_receiver) = async_channel::unbounded();
+        let clipboard = ClipboardHistory::shared(config.clipboard.clone());
+        start_collector(clipboard.clone(), clipboard_update_sender);
+        let (screenshot_command_sender, screenshot_command_receiver) = async_channel::unbounded();
+        let screenshot_command_server = match start_screenshot_server(screenshot_command_sender) {
+            Ok(server) => server,
+            Err(error) => {
+                error!("could not start screenshot command server: {error}");
+                return;
+            }
+        };
 
         let theme = BarTheme::from_environment(config.bar_height);
         let height = theme.bar_height;
@@ -979,6 +1185,12 @@ fn run_bar(config: Config) {
                         dcc_popup_anchor,
                         switcher_command_receiver,
                         switcher_command_server,
+                        clipboard,
+                        clipboard_update_receiver,
+                        clipboard_command_receiver,
+                        clipboard_command_server,
+                        screenshot_command_receiver,
+                        screenshot_command_server,
                         theme,
                         cx,
                     )
@@ -1157,8 +1369,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        DeviceControlCenterPage, DeviceControlCenterRoute, RunMode, StartupOptions,
-        SwitcherCommand, wallpaper_is_configured,
+        ClipboardCommand, DeviceControlCenterPage, DeviceControlCenterRoute, RunMode,
+        StartupOptions, SwitcherCommand, wallpaper_is_configured,
     };
     use crate::config::Config;
 
@@ -1231,6 +1443,19 @@ mod tests {
             RunMode::from_args(["switcher", "commit"]),
             Ok(RunMode::Switcher(SwitcherCommand::Commit))
         );
+        assert_eq!(
+            RunMode::from_args(["clipboard", "toggle"]),
+            Ok(RunMode::Clipboard(ClipboardCommand::Toggle))
+        );
+        assert_eq!(
+            RunMode::from_args(["clipboard", "clear"]),
+            Ok(RunMode::Clipboard(ClipboardCommand::Clear))
+        );
+        assert_eq!(
+            RunMode::from_args(["clipboard", "select"]),
+            Ok(RunMode::Clipboard(ClipboardCommand::Select))
+        );
+        assert_eq!(RunMode::from_args(["screenshot"]), Ok(RunMode::Screenshot));
         assert_eq!(
             RunMode::from_args(["wallpaper", "set", "resrc/wallpaper.png"]),
             Ok(RunMode::WallpaperSet("resrc/wallpaper.png".into()))

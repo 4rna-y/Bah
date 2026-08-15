@@ -48,6 +48,47 @@ pub fn focus_window(address: String) {
         });
 }
 
+/// Delivers a paste shortcut to a specific previously focused client. Wayland
+/// does not expose an application's focused widget, so the compositor remains
+/// the authority for whether that client accepts the shortcut.
+pub fn paste_into_window(address: String) {
+    let _ = thread::Builder::new()
+        .name("bah-clipboard-paste".to_string())
+        .spawn(move || {
+            // Give wl-copy a moment to claim the Wayland selection before
+            // delivering Ctrl+V. Without this, fast clients can receive the
+            // previous clipboard owner immediately after choosing an item.
+            thread::sleep(Duration::from_millis(75));
+            let selector = format!("address:{address}");
+            let dispatcher = format!(
+                "hl.dsp.send_shortcut({{ mods = \"CTRL\", key = \"V\", window = {selector:?} }})"
+            );
+            match SocketPaths::from_environment()
+                .and_then(|paths| HyprlandClient::new(paths).dispatch(&dispatcher))
+            {
+                Ok(()) => info!("sent clipboard paste shortcut to {address}"),
+                Err(error) => warn!("failed to paste into {address}: {error}"),
+            }
+        });
+}
+
+/// Activates a Hyprland keybind submap without blocking GPUI's drawing thread.
+/// ClipboardPanel uses this while it is visible so Escape remains available
+/// without giving the overlay keyboard focus (which would break the bar).
+pub fn set_keybind_submap(name: &'static str) {
+    let _ = thread::Builder::new()
+        .name("bah-keybind-submap".to_string())
+        .spawn(move || {
+            let dispatcher = format!("hl.dsp.submap({name:?})");
+            match SocketPaths::from_environment()
+                .and_then(|paths| HyprlandClient::new(paths).dispatch(&dispatcher))
+            {
+                Ok(()) => info!("activated Hyprland keybind submap {name}"),
+                Err(error) => warn!("failed to activate Hyprland keybind submap {name}: {error}"),
+            }
+        });
+}
+
 /// Closes a window by its Hyprland address without blocking GPUI's drawing thread.
 pub fn close_window(address: String) {
     let _ = thread::Builder::new()

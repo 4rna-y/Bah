@@ -42,6 +42,9 @@
               vulkan-loader
               libglvnd
               wireplumber
+              wl-clipboard
+              grim
+              slurp
               ffmpeg
               zenity
             ];

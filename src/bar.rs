@@ -1,4 +1,9 @@
-use std::{cell::RefCell, rc::Rc, sync::MutexGuard, time::Duration};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use async_channel::{Receiver, Sender};
 
@@ -11,9 +16,11 @@ use log::{error, info, warn};
 
 use crate::{
     airpods_popover::{AirPodsPopover, window_size as airpods_popover_window_size},
+    clipboard::{ClipboardPublisher, SharedClipboardHistory},
+    clipboard_panel::ClipboardPanel,
     hyprland::{
         IpcUpdate, JumpListAction, WorkspaceWindow, close_window, focus_window,
-        launch_jump_list_action, switch_to_workspace,
+        launch_jump_list_action, set_keybind_submap, switch_to_workspace,
     },
     modules::{
         clock::Clock,
@@ -58,6 +65,12 @@ pub struct Bar {
     airpods_popover: Option<WindowHandle<AirPodsPopover>>,
     window_switcher: Option<WindowHandle<WindowSwitcher>>,
     _window_switcher_command_server: crate::app::WindowSwitcherCommandServer,
+    clipboard_panel: Option<WindowHandle<ClipboardPanel>>,
+    clipboard: SharedClipboardHistory,
+    clipboard_publisher: Arc<Mutex<ClipboardPublisher>>,
+    _clipboard_command_server: crate::app::ClipboardCommandServer,
+    _screenshot_command_server: crate::app::ScreenshotCommandServer,
+    screenshot_active: bool,
     airpods_icon_bounds: Rc<RefCell<Bounds<Pixels>>>,
     bluetooth_icon_bounds: Rc<RefCell<Bounds<Pixels>>>,
     network_icon_bounds: Rc<RefCell<Bounds<Pixels>>>,
@@ -355,6 +368,12 @@ impl Bar {
         device_control_center_anchor: WindowHandle<DeviceControlCenterAnchor>,
         window_switcher_commands: Receiver<crate::app::SwitcherCommand>,
         window_switcher_command_server: crate::app::WindowSwitcherCommandServer,
+        clipboard: SharedClipboardHistory,
+        clipboard_updates: Receiver<()>,
+        clipboard_commands: Receiver<crate::app::ClipboardCommand>,
+        clipboard_command_server: crate::app::ClipboardCommandServer,
+        screenshot_commands: Receiver<()>,
+        screenshot_command_server: crate::app::ScreenshotCommandServer,
         theme: BarTheme,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -381,6 +400,12 @@ impl Bar {
             airpods_popover: None,
             window_switcher: None,
             _window_switcher_command_server: window_switcher_command_server,
+            clipboard_panel: None,
+            clipboard,
+            clipboard_publisher: Arc::new(Mutex::new(ClipboardPublisher::default())),
+            _clipboard_command_server: clipboard_command_server,
+            _screenshot_command_server: screenshot_command_server,
+            screenshot_active: false,
             network_icon_bounds: Rc::new(RefCell::new(Bounds::default())),
             airpods_icon_bounds: Rc::new(RefCell::new(Bounds::default())),
             bluetooth_icon_bounds: Rc::new(RefCell::new(Bounds::default())),
@@ -397,7 +422,96 @@ impl Bar {
         Self::start_network_settings_events(bar.controls.network_settings_events.clone(), cx);
         Self::start_device_control_center_routes(device_control_center_routes, cx);
         Self::start_window_switcher_commands(window_switcher_commands, cx);
+        Self::start_clipboard_commands(clipboard_commands, cx);
+        Self::start_clipboard_updates(clipboard_updates, cx);
+        Self::start_screenshot_commands(screenshot_commands, cx);
         bar
+    }
+
+    fn start_screenshot_commands(commands: Receiver<()>, cx: &mut Context<Self>) {
+        cx.spawn(async move |bar, cx| {
+            while commands.recv().await.is_ok() {
+                if bar.update(cx, |bar, cx| bar.start_screenshot(cx)).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_screenshot(&mut self, cx: &mut Context<Self>) {
+        if self.screenshot_active {
+            info!("ignoring screenshot command while a selection is already active");
+            return;
+        }
+        self.screenshot_active = true;
+        let receiver = crate::screenshot::start_capture(self.clipboard_publisher.clone());
+        cx.spawn(async move |bar, cx| {
+            let Ok(result) = receiver.recv().await else {
+                return;
+            };
+            let _ = bar.update(cx, |bar, _| {
+                bar.screenshot_active = false;
+                match result {
+                    crate::screenshot::ScreenshotResult::Saved {
+                        path,
+                        clipboard_copied,
+                    } => {
+                        if clipboard_copied {
+                            info!(
+                                "screenshot saved and copied to clipboard: {}",
+                                path.display()
+                            );
+                        } else {
+                            info!("screenshot saved: {}", path.display());
+                        }
+                    }
+                    crate::screenshot::ScreenshotResult::Cancelled => {
+                        info!("screenshot selection cancelled");
+                    }
+                    crate::screenshot::ScreenshotResult::Failed(error) => {
+                        error!("screenshot failed: {error:#}");
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn start_clipboard_commands(
+        commands: Receiver<crate::app::ClipboardCommand>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |bar, cx| {
+            while let Ok(command) = commands.recv().await {
+                if bar
+                    .update(cx, |bar, cx| bar.handle_clipboard_command(command, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_clipboard_updates(updates: Receiver<()>, cx: &mut Context<Self>) {
+        cx.spawn(async move |bar, cx| {
+            while updates.recv().await.is_ok() {
+                if bar
+                    .update(cx, |bar, cx| {
+                        if let Some(panel) = bar.clipboard_panel {
+                            let _ = panel.update(cx, |panel, _, cx| panel.refresh(cx));
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     fn start_window_switcher_commands(
@@ -776,6 +890,126 @@ impl Bar {
         self.close_window_switcher(cx);
         if let Some(address) = address {
             focus_window(address);
+        }
+    }
+
+    fn handle_clipboard_command(
+        &mut self,
+        command: crate::app::ClipboardCommand,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            crate::app::ClipboardCommand::Toggle => {
+                let already_open = self
+                    .clipboard_panel
+                    .and_then(|panel| panel.read_with(cx, |panel, _| panel.is_open()).ok())
+                    .unwrap_or(false);
+                if already_open {
+                    self.close_clipboard_panel(cx);
+                } else {
+                    self.open_clipboard_panel(cx);
+                }
+            }
+            crate::app::ClipboardCommand::Open => self.open_clipboard_panel(cx),
+            crate::app::ClipboardCommand::Close => self.close_clipboard_panel(cx),
+            crate::app::ClipboardCommand::Previous => {
+                if let Some(panel) = self.clipboard_panel {
+                    let _ = panel.update(cx, |panel, _, cx| panel.select_previous(cx));
+                }
+            }
+            crate::app::ClipboardCommand::Next => {
+                if let Some(panel) = self.clipboard_panel {
+                    let _ = panel.update(cx, |panel, _, cx| panel.select_next(cx));
+                }
+            }
+            crate::app::ClipboardCommand::Select => {
+                if let Some(panel) = self.clipboard_panel {
+                    let _ = panel.update(cx, |panel, window, cx| panel.choose_selected(window, cx));
+                }
+            }
+            crate::app::ClipboardCommand::Clear => {
+                let cleared = self
+                    .clipboard
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clear();
+                if let Err(error) = cleared {
+                    warn!("failed to clear clipboard history: {error:#}");
+                }
+                if let Some(panel) = self.clipboard_panel {
+                    let _ = panel.update(cx, |panel, _, cx| panel.refresh(cx));
+                }
+            }
+        }
+    }
+
+    fn open_clipboard_panel(&mut self, cx: &mut Context<Self>) {
+        let (target_window, focused_monitor) = self
+            .workspaces
+            .as_ref()
+            .map(|workspaces| {
+                let (_, active, monitor) = workspaces.switcher_state();
+                (active, monitor)
+            })
+            .unwrap_or((None, None));
+        if let Some(panel) = self.clipboard_panel {
+            let _ = panel.update(cx, |panel, window, cx| {
+                if !panel.is_open() {
+                    panel.open(target_window, window, cx);
+                }
+            });
+            set_keybind_submap("clipboard");
+            return;
+        }
+        let theme = self.theme;
+        let history = self.clipboard.clone();
+        let publisher = self.clipboard_publisher.clone();
+        let display_id = focused_monitor
+            .as_deref()
+            .and_then(|output| crate::app::display_id_for_output(cx, output))
+            .or(self.bar_display_id);
+        match cx.open_window(
+            WindowOptions {
+                titlebar: None,
+                focus: false,
+                show: true,
+                is_movable: false,
+                is_resizable: false,
+                display_id,
+                app_id: Some("bah-clipboard".to_string()),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_decorations: Some(WindowDecorations::Client),
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.0), px(0.0)),
+                    size: Size::new(px(1.0), px(1.0)),
+                })),
+                kind: WindowKind::LayerShell(LayerShellOptions {
+                    namespace: "bah-clipboard".to_string(),
+                    layer: Layer::Overlay,
+                    anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                    exclusive_zone: Some(px(0.0)),
+                    keyboard_interactivity: KeyboardInteractivity::None,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            move |_, cx| cx.new(|cx| ClipboardPanel::new(history, publisher, theme, cx)),
+        ) {
+            Ok(panel) => {
+                let _ = panel.update(cx, |panel, window, cx| {
+                    panel.open(target_window, window, cx)
+                });
+                self.clipboard_panel = Some(panel);
+                set_keybind_submap("clipboard");
+                info!("clipboard panel surface opened");
+            }
+            Err(error) => error!("failed to create clipboard panel surface: {error}"),
+        }
+    }
+
+    fn close_clipboard_panel(&mut self, cx: &mut Context<Self>) {
+        if let Some(panel) = self.clipboard_panel {
+            let _ = panel.update(cx, |panel, window, cx| panel.close(window, cx));
         }
     }
 

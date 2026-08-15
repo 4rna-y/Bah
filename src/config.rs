@@ -18,6 +18,26 @@ pub struct Config {
     /// Terminal launch command for the device control centre. The executable is
     /// the first item; remaining items are passed as literal arguments.
     pub device_control_center: DeviceControlCenterConfig,
+    /// Persistent clipboard history settings.
+    pub clipboard: ClipboardConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    pub max_entries: usize,
+    pub max_entry_bytes: u64,
+    pub max_total_bytes: u64,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 100,
+            max_entry_bytes: 32 * 1024 * 1024,
+            max_total_bytes: 256 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -103,6 +123,7 @@ impl Default for Config {
             wallpapers: BTreeMap::new(),
             notifications: NotificationConfig::default(),
             device_control_center: DeviceControlCenterConfig::default(),
+            clipboard: ClipboardConfig::default(),
         }
     }
 }
@@ -128,6 +149,14 @@ impl Config {
         }
         if config.notifications.pause_level > 100 {
             bail!("configuration notifications.pause_level must be between 0 and 100");
+        }
+        if config.clipboard.max_entries == 0
+            || config.clipboard.max_entry_bytes == 0
+            || config.clipboard.max_total_bytes < config.clipboard.max_entry_bytes
+        {
+            bail!(
+                "clipboard limits must be positive and max_total_bytes must be at least max_entry_bytes"
+            );
         }
         Ok(config)
     }

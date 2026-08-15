@@ -1,6 +1,8 @@
 mod airpods_popover;
 mod app;
 mod bar;
+mod clipboard;
+mod clipboard_panel;
 mod config;
 mod config_window;
 mod device_control_center;
@@ -10,6 +12,7 @@ mod modules;
 mod network_popover;
 mod notification_popup;
 mod notification_tray;
+mod screenshot;
 mod theme;
 mod tui_device_control_center;
 mod wallpaper;

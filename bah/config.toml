@@ -1,5 +1,10 @@
 bar_height = 36.0
 
+[clipboard]
+max_entries = 100
+max_entry_bytes = 33554432
+max_total_bytes = 268435456
+
 [wallpapers]
 eDP-1 = "/home/rg/Pictures/wallpaper/wallpaper.png"
 

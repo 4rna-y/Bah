@@ -16,6 +16,7 @@
 - `bah notifications` は dunstctl と同じ主要操作（close、history、count、pause、rule、reloadなど）を提供します。Cargo パッケージには既存のキーバインドを移行できる `dunstctl` 互換エントリも含まれます。
 - `.socket.sock` による初期ワークスペース取得と、`.socket2.sock` のworkspace/focused-monitorイベントによる更新
 - WindowsのAlt+Tabと同様に、通常のマップ済みウィンドウをMRU順で個別に切り替えるOverlay。Hyprlandの`toplevel-export`で一回だけ取得したプレビューを表示し、取得できない場合はアプリアイコンを表示します。
+- `Super+V`から開くClipboard履歴。テキスト、画像、URI、その他のMIME表現をユーザー限定のXDGデータ領域へ保存し、再起動後も選択できます。
 - IPCが利用不能でも、時計だけを表示して起動継続
 
 ## 開発環境と起動
@@ -129,6 +130,50 @@ enabled = true
 app_name = "NetworkManager アプレット"
 skip_popup = true
 ```
+
+## Clipboard履歴
+
+Clipboard履歴は`$XDG_DATA_HOME/bah/clipboard`（未設定時は`~/.local/share/bah/clipboard`）に、ユーザーだけが読める権限で保存されます。テキストは1行プレビュー、画像はパネル幅に合わせてアスペクト比を保って表示されます。選択すると表示前にフォーカスされていたウィンドウへCtrl+Vを送ります。貼り付けを受けない画面では、選択内容は通常Clipboardに残るため、次回のCtrl+Vで利用できます。
+
+```toml
+[clipboard]
+max_entries = 100
+max_entry_bytes = 33554432  # 32 MiB
+max_total_bytes = 268435456 # 256 MiB
+```
+
+Bahを常駐起動した状態で、Hyprland 0.55以降のLua設定へ次を追加してください。パネルを開いている間は`↑`/`↓`で選択を移動し、`Enter`で貼り付け、`Escape`または`Super+V`で閉じられます。
+
+```lua
+hl.bind("SUPER + V", hl.dsp.exec_cmd("bah clipboard toggle"))
+hl.define_submap("clipboard", function()
+  local close_clipboard = function()
+    hl.dispatch(hl.dsp.exec_cmd("bah clipboard close"))
+    hl.dispatch(hl.dsp.submap("reset"))
+  end
+  hl.bind("escape", close_clipboard)
+  hl.bind("SUPER + V", close_clipboard)
+  hl.bind("up", hl.dsp.exec_cmd("bah clipboard previous"))
+  hl.bind("down", hl.dsp.exec_cmd("bah clipboard next"))
+  hl.bind("return", hl.dsp.exec_cmd("bah clipboard select"))
+end)
+```
+
+`bah clipboard open`、`close`、`toggle`、`previous`、`next`、`select`に加え、永続履歴を消去する`bah clipboard clear`を利用できます。履歴機能には`wl-paste`と`wl-copy`（wl-clipboard）が必要です。
+
+## スクリーンショット
+
+`Super+Shift+S`で矩形スクリーンショットを開始します。Bah は選択 UI を開く前に全画面を固定取得するため、選択中に画面が変化しても、保存される画像はショートカットを押した時点の内容です。複数モニターをまたぐ矩形も選択できます。Escape でキャンセルします。
+
+PNG は `$XDG_PICTURES_DIR/Screenshots` に保存されます。`XDG_PICTURES_DIR` が環境変数にない場合は `~/.config/user-dirs.dirs` を参照し、最後は `~/Pictures/Screenshots` にフォールバックします。保存した PNG は Clipboard にもコピーされ、Bah の Clipboard 履歴へ取り込まれます。
+
+Bah を常駐起動した状態で、Hyprland Lua 設定に以下を追加してください。
+
+```lua
+hl.bind("SUPER + SHIFT + S", hl.dsp.exec_cmd(bah .. " screenshot"))
+```
+
+この機能には実行時に `grim` と `slurp`、Clipboard コピーに `wl-copy` が必要です。Nix 開発環境には含まれます。
 
 ## 通知デーモンの移行
 
