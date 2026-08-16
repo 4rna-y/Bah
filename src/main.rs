@@ -14,7 +14,6 @@ mod notification_popup;
 mod notification_tray;
 mod screenshot;
 mod theme;
-mod tui_device_control_center;
 mod wallpaper;
 mod window_snapshot;
 mod window_switcher;
@@ -97,17 +96,10 @@ fn main() {
     let log_path = log_file_path();
     match open_log_file(&log_path) {
         Ok(file) => {
-            if matches!(options.mode, app::RunMode::DeviceControlCenterTui(_)) {
-                // The TUI owns stdout for its alternate-screen renderer. Sending
-                // log records there corrupts Ratatui's cell buffer, so keep them
-                // in the persistent per-user log only.
-                logger.target(env_logger::Target::Pipe(Box::new(file)));
-            } else {
-                logger.target(env_logger::Target::Pipe(Box::new(TeeWriter {
-                    stdout: io::stdout(),
-                    file,
-                })));
-            }
+            logger.target(env_logger::Target::Pipe(Box::new(TeeWriter {
+                stdout: io::stdout(),
+                file,
+            })));
         }
         Err(error) => {
             eprintln!(

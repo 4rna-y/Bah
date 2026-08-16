@@ -1451,13 +1451,20 @@ impl Bar {
     fn show_device_control_center(
         &mut self,
         page: crate::app::DeviceControlCenterPage,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        crate::app::request_device_control_center(crate::app::DeviceControlCenterRoute {
-            page,
-            ssid: None,
-        });
+        if let Some(center) = self.device_control_center {
+            if center.update(cx, |_, _, _| {}).is_ok() {
+                self.close_device_control_center(cx);
+                return;
+            }
+            self.device_control_center = None;
+        }
+        self.close_status_tooltip(cx);
+        self.close_network_popover(cx);
+        self.close_airpods_popover(cx);
+        self.open_device_control_center(page, None, window, cx);
     }
 
     fn open_device_control_center(
@@ -1541,10 +1548,14 @@ impl Bar {
     fn show_device_control_center_route(
         &mut self,
         route: crate::app::DeviceControlCenterRoute,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        crate::app::request_device_control_center(route);
+        self.close_device_control_center(cx);
+        self.close_status_tooltip(cx);
+        self.close_network_popover(cx);
+        self.close_airpods_popover(cx);
+        self.open_device_control_center(route.page, route.ssid, window, cx);
     }
 
     fn close_device_control_center(&mut self, cx: &mut Context<Self>) {

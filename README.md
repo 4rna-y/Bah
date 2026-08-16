@@ -51,7 +51,7 @@ RUST_LOG=info cargo run -- window config
 ./bah window device-control-center bluetooth
 ```
 
-`window device-control-center` は既定のターミナルでDCC TUIを開きます。`network`、`bluetooth`、`display`で開始タブを指定できます。上部タブは`1`/`2`/`3`、項目選択は矢印または`j`/`k`、実行はEnter、終了は`q`またはEscです。GhosttyなどKitty Graphics Protocol対応端末ではディスプレイタブに壁紙プレビューを描画し、非対応端末でも操作は継続します。
+`window device-control-center` は、常駐中のBahへDCC GUIの表示を要求します。`network`、`bluetooth`、`display`で開始ページを指定できます。DCCは画面中央のポップアップとして開き、Wi-Fiパスワード入力、Bluetoothペアリング、モニター配置、出力別壁紙の選択をマウスで操作できます。Barが起動している必要があります。
 
 ## Window Switcher
 
@@ -108,11 +108,6 @@ bar_height = 36.0
 # DCCのディスプレイページで設定する出力別の壁紙です。
 # [wallpapers]
 # DP-1 = "/home/user/Pictures/external.png"
-
-# DCCを開く端末。先頭が実行ファイル、以降はそのまま渡す引数です。
-# 未設定時はTERMINAL、Ghostty、foot、kitty等を順に検出します。
-# [device_control_center]
-# terminal_command = ["ghostty", "--gtk-single-instance=false"]
 
 [notifications]
 # dunst の既定値と同じ上限・履歴数。critical_timeout_seconds = 0 は手動で閉じるまで表示します。
@@ -213,7 +208,7 @@ dunstctl close-all
 
 ## ディスプレイ
 
-`bah window device-control-center display`、またはDCC TUIの「Display」タブから、接続中のモニターを選択して矢印キーで配置できます。Shift+矢印は100px、Ctrl+矢印は1px単位で移動します。適用時には`~/.config/hypr/bah_displays.lua`を生成し、`hyprland.lua`へBah管理の`require("bah_displays")`を追加します。workspace 1はメインモニターへ割り当てられます。
+`bah window device-control-center display`、またはDCC GUIの「Display」ページから、接続中のモニターをドラッグして配置できます。選択したモニターを「メインモニターにする」と、当該モニターを`0x0`に固定したまま他モニターの相対位置を維持します。適用時には`~/.config/hypr/bah_displays.lua`を生成し、`hyprland.lua`へBah管理の`require("bah_displays")`を追加します。workspace 1はメインモニターへ割り当てられます。
 
 壁紙は出力ごとに選択できます。個別設定がない出力は従来の共通`wallpaper`を使用します。
 

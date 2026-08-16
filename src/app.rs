@@ -42,7 +42,7 @@ const SCREENSHOT_SOCKET_FILE: &str = "bah/screenshot.sock";
 const WALLPAPER_LOCK_FILE: &str = "bah/wallpaper.lock";
 const WALLPAPER_PID_FILE: &str = "bah/wallpaper.pid";
 const USAGE: &str = "usage: bah [--memusg] [--wgpu-backend BACKENDS] [--vk-driver-files PATH] \
-     [notifications COMMAND|switcher COMMAND|clipboard COMMAND|screenshot|window config|window device-control-center [network|bluetooth|display]|dcc [network|bluetooth|display]|wallpaper [set PATH|unset]]";
+     [notifications COMMAND|switcher COMMAND|clipboard COMMAND|screenshot|window config|window device-control-center [network|bluetooth|display]|wallpaper [set PATH|unset]]";
 
 /// Options that must be applied before GPUI initializes its graphics backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,61 +169,10 @@ fn encode_hex_ssid(ssid: &[u8]) -> String {
 
 /// Opens the network page without blocking a UI render callback.
 pub fn launch_device_control_center_network(ssid: Option<Vec<u8>>) {
-    launch_device_control_center(DeviceControlCenterRoute {
+    request_device_control_center(DeviceControlCenterRoute {
         page: DeviceControlCenterPage::Network,
         ssid,
     });
-}
-
-fn launch_device_control_center(route: DeviceControlCenterRoute) {
-    let _ = thread::Builder::new()
-        .name("bah-device-control-center-launch".to_string())
-        .spawn(move || {
-            let executable = match env::current_exe() {
-                Ok(executable) => executable,
-                Err(error) => {
-                    error!("could not resolve current executable: {error}");
-                    return;
-                }
-            };
-            let terminal = resolve_terminal();
-            let Some((program, mut arguments)) = terminal else {
-                error!("could not find a terminal emulator for the device control center");
-                return;
-            };
-            arguments.push("-e".into());
-            arguments.push(executable.into_os_string());
-            arguments.push("dcc".into());
-            arguments.push(route.page.as_arg().into());
-            if let Some(ssid) = route.ssid {
-                arguments.push("--ssid-hex".into());
-                arguments.push(encode_hex_ssid(&ssid).into());
-            }
-            if let Err(error) = Command::new(program).args(arguments).spawn() {
-                error!("failed to launch device control center: {error}");
-            }
-        });
-}
-
-fn resolve_terminal() -> Option<(OsString, Vec<OsString>)> {
-    let configured = Config::load()
-        .unwrap_or_default()
-        .device_control_center
-        .terminal_command;
-    if let Some((program, arguments)) = configured.split_first()
-        && !program.trim().is_empty()
-    {
-        return Some((program.into(), arguments.iter().map(Into::into).collect()));
-    }
-    if let Some(command) = env::var_os("TERMINAL").filter(|value| !value.is_empty()) {
-        // TERMINAL is intentionally accepted only as an executable name: treating it as a shell
-        // command would make a user configuration value executable shell input.
-        return Some((command, Vec::new()));
-    }
-    ["ghostty", "foot", "kitty", "wezterm", "alacritty"]
-        .into_iter()
-        .find(|candidate| Command::new(candidate).arg("--version").output().is_ok())
-        .map(|candidate| (OsString::from(candidate), Vec::new()))
 }
 
 fn device_control_center_socket_path() -> io::Result<PathBuf> {
@@ -245,9 +194,15 @@ fn write_device_control_center_route(route: &DeviceControlCenterRoute) -> io::Re
     stream.write_all(b"\n")
 }
 
-/// Opens the DCC in the configured terminal without blocking a GPUI callback.
+/// Requests the DCC from an in-process surface without blocking its render callback.
 pub(crate) fn request_device_control_center(route: DeviceControlCenterRoute) {
-    launch_device_control_center(route);
+    let _ = thread::Builder::new()
+        .name("bah-device-control-center-request".to_string())
+        .spawn(move || {
+            if let Err(error) = write_device_control_center_route(&route) {
+                error!("failed to request device control center: {error}");
+            }
+        });
 }
 
 fn start_device_control_center_route_server(
@@ -535,7 +490,6 @@ pub enum RunMode {
     Bar,
     ConfigWindow,
     DeviceControlCenter(DeviceControlCenterRoute),
-    DeviceControlCenterTui(DeviceControlCenterRoute),
     Notifications(Vec<OsString>),
     Switcher(SwitcherCommand),
     Clipboard(ClipboardCommand),
@@ -589,16 +543,6 @@ pub enum DeviceControlCenterPage {
     Network,
     Bluetooth,
     Display,
-}
-
-impl DeviceControlCenterPage {
-    fn as_arg(self) -> &'static str {
-        match self {
-            Self::Network => "network",
-            Self::Bluetooth => "bluetooth",
-            Self::Display => "display",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
@@ -719,32 +663,6 @@ impl RunMode {
                     ssid: Some(decode_hex_ssid(ssid)?),
                 }))
             }
-            [dcc] if dcc == "dcc" => Ok(Self::DeviceControlCenterTui(
-                DeviceControlCenterRoute::default(),
-            )),
-            [dcc, page] if dcc == "dcc" && page == "network" => Ok(Self::DeviceControlCenterTui(
-                DeviceControlCenterRoute::default(),
-            )),
-            [dcc, page] if dcc == "dcc" && page == "bluetooth" => {
-                Ok(Self::DeviceControlCenterTui(DeviceControlCenterRoute {
-                    page: DeviceControlCenterPage::Bluetooth,
-                    ssid: None,
-                }))
-            }
-            [dcc, page] if dcc == "dcc" && page == "display" => {
-                Ok(Self::DeviceControlCenterTui(DeviceControlCenterRoute {
-                    page: DeviceControlCenterPage::Display,
-                    ssid: None,
-                }))
-            }
-            [dcc, page, flag, ssid]
-                if dcc == "dcc" && page == "network" && flag == "--ssid-hex" =>
-            {
-                Ok(Self::DeviceControlCenterTui(DeviceControlCenterRoute {
-                    page: DeviceControlCenterPage::Network,
-                    ssid: Some(decode_hex_ssid(ssid)?),
-                }))
-            }
             [wallpaper] if wallpaper == "wallpaper" => Ok(Self::Wallpaper),
             [wallpaper, set, path] if wallpaper == "wallpaper" && set == "set" => {
                 Ok(Self::WallpaperSet(PathBuf::from(path)))
@@ -763,7 +681,6 @@ pub fn run(mode: RunMode, config: Config) {
         RunMode::Bar => run_bar(config),
         RunMode::ConfigWindow => run_config_window(config),
         RunMode::DeviceControlCenter(route) => run_device_control_center(route),
-        RunMode::DeviceControlCenterTui(route) => crate::tui_device_control_center::run(route),
         RunMode::Notifications(arguments) => run_notifications(arguments),
         RunMode::Switcher(command) => run_switcher_command(command),
         RunMode::Clipboard(command) => run_clipboard_command(command),
@@ -1210,7 +1127,9 @@ fn wallpaper_is_configured(config: &Config) -> bool {
 }
 
 fn run_device_control_center(route: DeviceControlCenterRoute) {
-    launch_device_control_center(route);
+    if let Err(error) = write_device_control_center_route(&route) {
+        error!("Bar is not running; cannot open the device control center popover: {error}");
+    }
 }
 
 fn run_notifications(arguments: Vec<OsString>) {
@@ -1400,13 +1319,7 @@ mod tests {
                 DeviceControlCenterRoute::default(),
             ))
         );
-        assert_eq!(
-            RunMode::from_args(["dcc", "display"]),
-            Ok(RunMode::DeviceControlCenterTui(DeviceControlCenterRoute {
-                page: DeviceControlCenterPage::Display,
-                ssid: None,
-            }))
-        );
+        assert!(RunMode::from_args(["dcc", "display"]).is_err());
         assert_eq!(
             RunMode::from_args([
                 "window",

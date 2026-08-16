@@ -30,6 +30,16 @@ runtime_library_path() {
     fi
 }
 
+runtime_zenity_path() {
+    if [[ -n "${IN_NIX_SHELL:-}" ]]; then
+        command -v zenity
+    elif command -v nix >/dev/null 2>&1; then
+        nix develop "$repo_dir" --command bash -c 'command -v zenity'
+    else
+        command -v zenity
+    fi
+}
+
 cd "$repo_dir"
 build
 
@@ -38,13 +48,20 @@ if [[ -z "$runtime_libraries" ]]; then
     printf '%s\n' 'No runtime library path was available; run this script through nix develop.' >&2
     exit 1
 fi
+runtime_zenity="$(runtime_zenity_path)"
+if [[ -z "$runtime_zenity" ]]; then
+    printf '%s\n' 'Zenity was not available; install it or run this script through nix develop.' >&2
+    exit 1
+fi
+readonly runtime_zenity_directory="$(dirname -- "$runtime_zenity")"
 
 mkdir -p "$install_dir" "$runtime_dir"
 install -m 0755 "$source_binary" "$runtime_binary"
 # GPUI loads Wayland and Vulkan dynamically. The small launcher preserves the
-# Nix development shell's runtime library lookup when Hyprland starts Bah.
-printf '#!/usr/bin/env bash\nset -euo pipefail\nreadonly runtime_libraries=%q\nexport LD_LIBRARY_PATH="${runtime_libraries}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"\nexec %q "$@"\n' \
-    "$runtime_libraries" "$runtime_binary" >"$installed_binary"
+# Nix development shell's runtime library and Zenity lookup when Hyprland
+# starts Bah. Zenity provides the native Wayland wallpaper file chooser.
+printf '#!/usr/bin/env bash\nset -euo pipefail\nreadonly runtime_libraries=%q\nreadonly runtime_zenity_directory=%q\nexport LD_LIBRARY_PATH="${runtime_libraries}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"\nexport PATH="${runtime_zenity_directory}${PATH:+:${PATH}}"\nexec %q "$@"\n' \
+    "$runtime_libraries" "$runtime_zenity_directory" "$runtime_binary" >"$installed_binary"
 chmod 0755 "$installed_binary"
 ln -sfn "bah" "$compatibility_binary"
 

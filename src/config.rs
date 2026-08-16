@@ -15,9 +15,6 @@ pub struct Config {
     pub wallpapers: BTreeMap<String, PathBuf>,
     /// Notification daemon and popup behaviour.
     pub notifications: NotificationConfig,
-    /// Terminal launch command for the device control centre. The executable is
-    /// the first item; remaining items are passed as literal arguments.
-    pub device_control_center: DeviceControlCenterConfig,
     /// Persistent clipboard history settings.
     pub clipboard: ClipboardConfig,
 }
@@ -38,12 +35,6 @@ impl Default for ClipboardConfig {
             max_total_bytes: 256 * 1024 * 1024,
         }
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, Default)]
-#[serde(default)]
-pub struct DeviceControlCenterConfig {
-    pub terminal_command: Vec<String>,
 }
 
 /// Native notification settings. These intentionally cover Bah's behaviour
@@ -122,7 +113,6 @@ impl Default for Config {
             wallpaper: None,
             wallpapers: BTreeMap::new(),
             notifications: NotificationConfig::default(),
-            device_control_center: DeviceControlCenterConfig::default(),
             clipboard: ClipboardConfig::default(),
         }
     }
@@ -186,4 +176,19 @@ pub fn config_path() -> Result<PathBuf> {
             .context("XDG_CONFIG_HOME is unset and the current directory is unavailable")?,
     };
     Ok(root.join("bah").join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn ignores_removed_terminal_dcc_configuration() {
+        let config: Config = toml::from_str(
+            "[device_control_center]\nterminal_command = [\"ghostty\", \"--gtk-single-instance=false\"]\n",
+        )
+        .expect("legacy DCC configuration should remain readable");
+
+        assert_eq!(config.bar_height, 36.0);
+    }
 }
